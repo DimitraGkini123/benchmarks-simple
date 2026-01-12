@@ -175,3 +175,12 @@ pico_enable_stdio_usb(fft_every_100ms 1)
 pico_enable_stdio_uart(fft_every_100ms 0)
 pico_add_extra_outputs(fft_every_100ms)
 
+add_executable(ma_every_100ms
+ ma_every_100ms.c
+)
+
+target_link_libraries(ma_every_100ms pico_stdlib)
+pico_enable_stdio_usb(ma_every_100ms 1)
+pico_enable_stdio_uart(ma_every_100ms 0)
+pico_add_extra_outputs(ma_every_100ms)
+

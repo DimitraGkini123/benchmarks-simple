@@ -4,7 +4,7 @@ import csv
 # Ρυθμίσεις
 SERIAL_PORT = 'COM7'
 BAUD_RATE = 115200 # Η default ταχύτητα του Pico
-OUTPUT_FILE = 'pico_data_device2.csv'
+OUTPUT_FILE = 'pico_data_device3.csv'
 
 try:
     # Άνοιγμα της σειριακής θύρας

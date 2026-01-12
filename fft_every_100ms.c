@@ -204,7 +204,6 @@ static inline void run_workload_step(int label) {
         fft_sink += acc;
     }
 
-    __asm volatile ("wfi");
 }
 
 int main(void) {
