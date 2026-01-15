@@ -184,3 +184,11 @@ pico_enable_stdio_usb(ma_every_100ms 1)
 pico_enable_stdio_uart(ma_every_100ms 0)
 pico_add_extra_outputs(ma_every_100ms)
 
+add_executable(seizure_every_100ms
+ seizure_every_100ms.c
+)
+
+target_link_libraries(seizure_every_100ms pico_stdlib)
+pico_enable_stdio_usb(seizure_every_100ms 1)
+pico_enable_stdio_uart(seizure_every_100ms 0)
+pico_add_extra_outputs(seizure_every_100ms)
