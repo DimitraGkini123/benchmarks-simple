@@ -7,7 +7,9 @@
 #include <stdlib.h>
 #include <math.h>
 #include <stdbool.h>
-
+#include <stdint.h>
+#include <stddef.h>
+#include "sha256.h"
 #include "pico/stdlib.h"
 #include "hardware/timer.h"
 
@@ -45,6 +47,9 @@
 #ifndef VERIFIER_PORT
 #define VERIFIER_PORT 4242
 #endif
+// linker symbols provided by Pico toolchain
+extern const uint8_t __flash_binary_start;
+extern const uint8_t __flash_binary_end;
 
 static inline void dwt_enable_all(void) {
     DEMCR |= DEMCR_TRCENA;
@@ -64,6 +69,42 @@ static inline void dwt_enable_all(void) {
                 DWT_CTRL_LSUEVTENA |
                 DWT_CTRL_FOLDEVTENA;
 }
+//code injection for dummies 
+__attribute__((used))
+static void fw_dummy_never_called(void) {
+    // never called
+    volatile uint32_t x = 0x12345678u;
+    (void)x;
+}
+
+static void to_hex(const uint8_t *in, size_t n, char *out_hex /* size 2n+1 */) {
+    static const char *H = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) {
+        out_hex[2*i+0] = H[(in[i] >> 4) & 0xF];
+        out_hex[2*i+1] = H[in[i] & 0xF];
+    }
+    out_hex[2*n] = 0;
+}
+static void compute_fw_hash(uint8_t out_hash[32]) {
+    const uint8_t *start = &__flash_binary_start;
+    const uint8_t *end   = &__flash_binary_end;
+    size_t len = (size_t)(end - start);
+
+    sha256_ctx ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, start, len);
+    sha256_final(&ctx, out_hash);
+}
+static void compute_nonce_bound_response(const uint8_t *nonce, size_t nonce_len,
+                                         const uint8_t fw_hash[32],
+                                         uint8_t out_resp[32]) {
+    sha256_ctx ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, nonce, nonce_len);
+    sha256_update(&ctx, fw_hash, 32);
+    sha256_final(&ctx, out_resp);
+}
+
 
 // ===================== Your signal pipeline =====================
 #define LEN 512
@@ -323,7 +364,7 @@ static int  rxlen = 0;
 static volatile bool rx_dirty = false;
 
 // send (safe from main loop)
-static void comm_send_str(const char *s) {
+/*static void comm_send_str(const char *s) {
     if (!g_connected || !g_pcb) return;
 
     cyw43_arch_lwip_begin();
@@ -331,6 +372,45 @@ static void comm_send_str(const char *s) {
     if (e == ERR_OK) tcp_output(g_pcb);
     cyw43_arch_lwip_end();
 }
+    */
+static bool comm_send_all(const char *buf, size_t len) {
+    if (!g_connected || !g_pcb) return false;
+
+    size_t off = 0;
+    while (off < len) {
+        cyw43_arch_lwip_begin();
+
+        // πόσο χώρο έχουμε στο TCP send buffer
+        u16_t space = tcp_sndbuf(g_pcb);
+
+        if (space == 0) {
+            // δεν υπάρχει χώρος τώρα -> δοκίμασε αργότερα
+            cyw43_arch_lwip_end();
+            sleep_ms(1);
+            continue;
+        }
+
+        // στείλε μέχρι όσο χωράει
+        u16_t chunk = (u16_t)((len - off) < (size_t)space ? (len - off) : (size_t)space);
+
+        err_t e = tcp_write(g_pcb, buf + off, chunk, TCP_WRITE_FLAG_COPY);
+        if (e == ERR_OK) {
+            tcp_output(g_pcb);
+            off += chunk;
+            cyw43_arch_lwip_end();
+        } else {
+            // ERR_MEM ή άλλο transient
+            cyw43_arch_lwip_end();
+            sleep_ms(1);
+        }
+    }
+    return true;
+}
+
+static void comm_send_str(const char *s) {
+    (void)comm_send_all(s, strlen(s));
+}
+
 
 // very tiny req_id extractor: finds "req_id":"...."
 static void extract_req_id(const char *line, char *out, int out_sz) {
@@ -411,7 +491,7 @@ static void handle_line(char *line) {
 
     uint32_t dropped_overflow_snapshot = ring_dropped;
 
-    char out[4096];
+    char out[8192];
     int pos = 0;
 
     pos += snprintf(out + pos, sizeof(out) - pos,
@@ -456,10 +536,68 @@ static void handle_line(char *line) {
     comm_send_str(out);
     return;
 }
+    if (strstr(line, "\"type\":\"ATTEST_REQUEST\"")) {
+    char req_id2[64];
+    extract_req_id(line, req_id2, (int)sizeof(req_id2));
 
+    // --- parse nonce hex ---
+    // Expect: "nonce":"<hex>"
+    char nonce_hex[128] = {0};
+    const char *pn = strstr(line, "\"nonce\":\"");
+    if (!pn) {
+        char out[180];
+        snprintf(out, sizeof(out),
+                 "{\"type\":\"ERROR\",\"req_id\":\"%s\",\"reason\":\"missing_nonce\"}\n",
+                 req_id2[0] ? req_id2 : "none");
+        comm_send_str(out);
+        return;
+    }
+    pn += strlen("\"nonce\":\"");
+    const char *qn = strchr(pn, '"');
+    if (!qn) {
+        char out[180];
+        snprintf(out, sizeof(out),
+                 "{\"type\":\"ERROR\",\"req_id\":\"%s\",\"reason\":\"bad_nonce\"}\n",
+                 req_id2[0] ? req_id2 : "none");
+        comm_send_str(out);
+        return;
+    }
+    int nhex = (int)(qn - pn);
+    if (nhex <= 0 || nhex >= (int)sizeof(nonce_hex)) nhex = (int)sizeof(nonce_hex) - 1;
+    memcpy(nonce_hex, pn, nhex);
+    nonce_hex[nhex] = 0;
 
+    // hex -> bytes
+    // very small hex decode
+    uint8_t nonce[64];
+    size_t nonce_len = 0;
+    for (int i = 0; i + 1 < nhex && nonce_len < sizeof(nonce); i += 2) {
+        char a = nonce_hex[i], b = nonce_hex[i+1];
+        uint8_t hi = (a <= '9') ? (a - '0') : ((a | 32) - 'a' + 10);
+        uint8_t lo = (b <= '9') ? (b - '0') : ((b | 32) - 'a' + 10);
+        nonce[nonce_len++] = (hi << 4) | lo;
+    }
 
-    // (αργότερα: GET_METRICS / GET_WINDOWS / ATTEST_REQUEST)
+    // compute fw hash + nonce-bound response
+    uint8_t fw_hash[32], resp[32];
+    compute_fw_hash(fw_hash);
+    compute_nonce_bound_response(nonce, nonce_len, fw_hash, resp);
+
+    char fw_hex[65], resp_hex[65];
+    to_hex(fw_hash, 32, fw_hex);
+    to_hex(resp, 32, resp_hex);
+
+    // Send ATTEST_RESPONSE (includes fw_hash_hex so verifier can provision)
+    char out[420];
+    snprintf(out, sizeof(out),
+        "{\"type\":\"ATTEST_RESPONSE\",\"req_id\":\"%s\",\"mode\":\"FULL_HASH_PROVER\",\"region\":\"fw\","
+        "\"fw_hash_hex\":\"%s\",\"response_hex\":\"%s\"}\n",
+        req_id2[0] ? req_id2 : "none", fw_hex, resp_hex);
+
+    comm_send_str(out);
+    return;
+}
+
     char out[220];
     snprintf(out, sizeof(out),
              "{\"type\":\"ERROR\",\"req_id\":\"%s\",\"reason\":\"unknown_request\"}\n",
@@ -611,6 +749,7 @@ comm_connect_wifi_tcp();
 
         while (1) {
             // keep CPU doing the workload; timers sample in background
+            cyw43_arch_poll();
             run_workload_step((int)current_label);
             comm_poll_parse();
 

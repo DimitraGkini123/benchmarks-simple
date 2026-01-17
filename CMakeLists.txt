@@ -216,6 +216,7 @@ pico_add_extra_outputs(lp_every_100ms_with_rop)
 # ---------------------------------------------------------
 add_executable(lp_every_100ms_wifi
     lp_every_100ms_wifi.c
+    sha256.c
 )
 
 target_link_libraries(lp_every_100ms_wifi
@@ -240,3 +241,4 @@ target_compile_definitions(lp_every_100ms_wifi PRIVATE
 )
 
 pico_add_extra_outputs(lp_every_100ms_wifi)
+
