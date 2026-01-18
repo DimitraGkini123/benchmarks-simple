@@ -47,6 +47,10 @@
 #ifndef VERIFIER_PORT
 #define VERIFIER_PORT 4242
 #endif
+// ------- Partial attestation config -------
+#define FW_BLOCKS_N   20          // πόσα κομμάτια χωρίζουμε το FW region
+#define MAX_REQ_BLOCKS 32         // max indices που δέχεσαι σε ένα request (προστασία)
+
 // linker symbols provided by Pico toolchain
 extern const uint8_t __flash_binary_start;
 extern const uint8_t __flash_binary_end;
@@ -104,6 +108,55 @@ static void compute_nonce_bound_response(const uint8_t *nonce, size_t nonce_len,
     sha256_update(&ctx, fw_hash, 32);
     sha256_final(&ctx, out_resp);
 }
+static bool compute_fw_block_hash(uint32_t block_idx, uint8_t out_hash[32],
+                                  uint32_t *out_off, uint32_t *out_len) {
+    const uint8_t *start = &__flash_binary_start;
+    const uint8_t *end   = &__flash_binary_end;
+
+    size_t fw_len = (size_t)(end - start);
+    if (fw_len == 0) return false;
+
+    if (block_idx >= FW_BLOCKS_N) return false;
+
+    // ceil-div για block size (ώστε να καλύψει όλο το fw)
+    size_t block_size = (fw_len + (FW_BLOCKS_N - 1)) / FW_BLOCKS_N;
+
+    size_t off = (size_t)block_idx * block_size;
+    if (off >= fw_len) return false;
+
+    size_t len = block_size;
+    if (off + len > fw_len) len = fw_len - off;
+
+    sha256_ctx ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, start + off, len);
+    sha256_final(&ctx, out_hash);
+
+    if (out_off) *out_off = (uint32_t)off;
+    if (out_len) *out_len = (uint32_t)len;
+    return true;
+}
+static int parse_indices_list(const char *line, uint32_t *out, int out_max) {
+    const char *p = strstr(line, "\"indices\":[");
+    if (!p) return 0; // δεν βρέθηκε
+    p += strlen("\"indices\":[");
+
+    int n = 0;
+    while (*p && *p != ']' && n < out_max) {
+        while (*p == ' ' || *p == '\t' || *p == ',') p++;
+        if (*p == ']') break;
+
+        char *endptr = NULL;
+        long v = strtol(p, &endptr, 10);
+        if (endptr == p) break; // δεν διάβασε number
+        if (v < 0) v = 0;
+        out[n++] = (uint32_t)v;
+        p = endptr;
+    }
+    return n;
+}
+
+
 
 
 // ===================== Your signal pipeline =====================
@@ -536,12 +589,24 @@ static void handle_line(char *line) {
     comm_send_str(out);
     return;
 }
-    if (strstr(line, "\"type\":\"ATTEST_REQUEST\"")) {
+if (strstr(line, "\"type\":\"ATTEST_REQUEST\"")) {
     char req_id2[64];
     extract_req_id(line, req_id2, (int)sizeof(req_id2));
 
-    // --- parse nonce hex ---
-    // Expect: "nonce":"<hex>"
+    // --- detect mode ---
+    bool is_full    = (strstr(line, "\"mode\":\"FULL_HASH_PROVER\"") != NULL);
+    bool is_partial = (strstr(line, "\"mode\":\"PARTIAL_BLOCKS\"") != NULL);
+
+    if (!is_full && !is_partial) {
+        char out[220];
+        snprintf(out, sizeof(out),
+                 "{\"type\":\"ERROR\",\"req_id\":\"%s\",\"reason\":\"unknown_attest_mode\"}\n",
+                 req_id2[0] ? req_id2 : "none");
+        comm_send_str(out);
+        return;
+    }
+
+    // --- parse nonce hex (κρατάμε ίδιο parsing όπως πριν) ---
     char nonce_hex[128] = {0};
     const char *pn = strstr(line, "\"nonce\":\"");
     if (!pn) {
@@ -568,7 +633,6 @@ static void handle_line(char *line) {
     nonce_hex[nhex] = 0;
 
     // hex -> bytes
-    // very small hex decode
     uint8_t nonce[64];
     size_t nonce_len = 0;
     for (int i = 0; i + 1 < nhex && nonce_len < sizeof(nonce); i += 2) {
@@ -578,25 +642,82 @@ static void handle_line(char *line) {
         nonce[nonce_len++] = (hi << 4) | lo;
     }
 
-    // compute fw hash + nonce-bound response
-    uint8_t fw_hash[32], resp[32];
-    compute_fw_hash(fw_hash);
-    compute_nonce_bound_response(nonce, nonce_len, fw_hash, resp);
+    // ---------------- PARTIAL ----------------
+    if (is_partial) {
+        uint32_t idxs[MAX_REQ_BLOCKS];
+        int k = parse_indices_list(line, idxs, MAX_REQ_BLOCKS);
 
-    char fw_hex[65], resp_hex[65];
-    to_hex(fw_hash, 32, fw_hex);
-    to_hex(resp, 32, resp_hex);
+        // αν δεν δώσει indices => στείλε όλα (βολικό για provisioning)
+        bool provision_all = (k == 0);
 
-    // Send ATTEST_RESPONSE (includes fw_hash_hex so verifier can provision)
-    char out[420];
-    snprintf(out, sizeof(out),
-        "{\"type\":\"ATTEST_RESPONSE\",\"req_id\":\"%s\",\"mode\":\"FULL_HASH_PROVER\",\"region\":\"fw\","
-        "\"fw_hash_hex\":\"%s\",\"response_hex\":\"%s\"}\n",
-        req_id2[0] ? req_id2 : "none", fw_hex, resp_hex);
+        char out[12000];
+        int pos = 0;
 
-    comm_send_str(out);
-    return;
+        pos += snprintf(out + pos, sizeof(out) - pos,
+            "{\"type\":\"ATTEST_RESPONSE\",\"req_id\":\"%s\",\"mode\":\"PARTIAL_BLOCKS\",\"region\":\"fw\","
+            "\"block_count\":%u,\"blocks\":[",
+            req_id2[0] ? req_id2 : "none",
+            (unsigned)FW_BLOCKS_N
+        );
+
+        int sent = 0;
+        int limit = provision_all ? (int)FW_BLOCKS_N : k;
+
+        for (int i = 0; i < limit; i++) {
+            uint32_t bi = provision_all ? (uint32_t)i : idxs[i];
+
+            uint8_t bh[32];
+            uint32_t off = 0, blen = 0;
+            if (!compute_fw_block_hash(bi, bh, &off, &blen)) {
+                continue;
+            }
+
+            uint8_t resp[32];
+            compute_nonce_bound_response(nonce, nonce_len, bh, resp);   // <- ΝΕΟ (reuse του full helper)
+
+            char bh_hex[65];
+            char resp_hex[65];
+            to_hex(bh, 32, bh_hex);
+            to_hex(resp, 32, resp_hex);
+
+            if (sent > 0) pos += snprintf(out + pos, sizeof(out) - pos, ",");
+
+            pos += snprintf(out + pos, sizeof(out) - pos,
+                "{\"index\":%u,\"off\":%u,\"len\":%u,\"hash_hex\":\"%s\",\"response_hex\":\"%s\"}",
+                (unsigned)bi, (unsigned)off, (unsigned)blen, bh_hex, resp_hex
+            );
+
+
+            sent++;
+            if (pos > (int)sizeof(out) - 220) break; // safety
+        }
+
+        pos += snprintf(out + pos, sizeof(out) - pos, "],\"count\":%d}\n", sent);
+        comm_send_str(out);
+        return;
+    }
+
+    // ---------------- FULL ----------------
+    if (is_full) {
+        uint8_t fw_hash[32], resp[32];
+        compute_fw_hash(fw_hash);
+        compute_nonce_bound_response(nonce, nonce_len, fw_hash, resp);
+
+        char fw_hex[65], resp_hex[65];
+        to_hex(fw_hash, 32, fw_hex);
+        to_hex(resp, 32, resp_hex);
+
+        char out[420];
+        snprintf(out, sizeof(out),
+            "{\"type\":\"ATTEST_RESPONSE\",\"req_id\":\"%s\",\"mode\":\"FULL_HASH_PROVER\",\"region\":\"fw\","
+            "\"fw_hash_hex\":\"%s\",\"response_hex\":\"%s\"}\n",
+            req_id2[0] ? req_id2 : "none", fw_hex, resp_hex);
+
+        comm_send_str(out);
+        return;
+    }
 }
+
 
     char out[220];
     snprintf(out, sizeof(out),
