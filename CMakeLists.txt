@@ -236,9 +236,10 @@ pico_enable_stdio_uart(lp_every_100ms_wifi 0)
 target_compile_definitions(lp_every_100ms_wifi PRIVATE
     WIFI_SSID=\"${WIFI_SSID}\"
     WIFI_PASSWORD=\"${WIFI_PASSWORD}\"
-    VERIFIER_IP=\"${VERIFIER_IP}\"
-    VERIFIER_PORT=${VERIFIER_PORT}
+    VERIFIER_IP=\"192.168.68.102\"
+    VERIFIER_PORT=4242
 )
 
 pico_add_extra_outputs(lp_every_100ms_wifi)
+
 
