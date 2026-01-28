@@ -29,8 +29,18 @@
 #define DWT_CTRL_LSUEVTENA   (1u << 20)
 #define DWT_CTRL_FOLDEVTENA  (1u << 21)
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// ===================== Config =====================
 #define DEVICE_ID 1
 
+// Θέλεις περισσότερα SAFE → κάνε SAFE_REPEATS >= 6 για ισορροπία με attacks.
+#define SAMPLES_PER_BUCKET 300
+#define SAFE_REPEATS       6
+
+// ===================== DWT helpers =====================
 static inline void dwt_enable_all(void) {
     DEMCR |= DEMCR_TRCENA;
     DWT_LAR = 0xC5ACCE55;
@@ -50,6 +60,15 @@ static inline void dwt_enable_all(void) {
                 DWT_CTRL_FOLDEVTENA;
 }
 
+static inline void dwt_reset_event_counters(void) {
+    DWT_CYCCNT   = 0;
+    DWT_CPICNT   = 0;
+    DWT_EXCCNT   = 0;
+    DWT_SLEEPCNT = 0;
+    DWT_LSUCNT   = 0;
+    DWT_FOLDCNT  = 0;
+}
+
 static void wait_for_usb_connection(void) {
     while (!stdio_usb_connected()) sleep_ms(100);
     sleep_ms(200);
@@ -63,7 +82,7 @@ static double sig_filt[LEN];
 #define LPF_ORDER 8
 static const double lp_coefficients[LPF_ORDER] = {
     -0.00511, 0.01017, 0.05730, 0.20164,
-    0.47291, 0.20164, 0.05730, 0.01017
+     0.47291, 0.20164, 0.05730, 0.01017
 };
 
 static void generate_light_signal(double fs) {
@@ -139,88 +158,138 @@ static double compute_hr(const double *x, size_t len, double fs, double thr) {
 
 static volatile double hr_sink = 0.0;
 
-// ===================== Attack labels (SIMULATED anomaly, not a real exploit) =====================
+// ===================== Attack labels (synthetic anomalies) =====================
 typedef enum {
     ATTACK_NONE = 0,
-    ATTACK_ROP  = 1,
+    ATTACK_ROP  = 1,  // synthetic control-flow-ish + irregular memory access
+    ATTACK_INJ  = 2,  // synthetic heavy writes
 } attack_t;
 
 static volatile attack_t  current_attack_type  = ATTACK_NONE;
 static volatile uint32_t  current_attack_level = 0;   // 0/1/2
-static inline uint32_t compromised_flag(void) { return (current_attack_type != ATTACK_NONE) ? 1u : 0u; }
+static volatile uint32_t  current_workload      = 0;  // 0/1/2
 
-// Map to a single multiclass id (useful if you want one-label training)
-// 0..2 = safe (light/medium/heavy)
-// 3..8 = rop combos:
-// 3 light_rop_L1, 4 light_rop_L2, 5 medium_rop_L1, 6 medium_rop_L2, 7 heavy_rop_L1, 8 heavy_rop_L2
-static inline uint32_t class_id(uint32_t workload, uint32_t attack_type, uint32_t attack_level) {
-    if (attack_type == ATTACK_NONE) return workload; // 0..2
-    // rop:
-    uint32_t lvl = (attack_level > 0) ? (attack_level - 1u) : 0u; // 0 or 1
-    return 3u + workload * 2u + lvl;
+static inline uint32_t compromised_flag(void) {
+    return (current_attack_type != ATTACK_NONE) ? 1u : 0u;
 }
 
-// small buffer to create memory activity
-#define RW_BUF_N 2048
+// Leaf label WITHOUT unknown:
+// 0..2: SAFE workloads
+// 3: ROP
+// 4: INJ
+static inline uint32_t leaf_label(uint32_t workload, uint32_t attack_type) {
+    if (attack_type == ATTACK_NONE) return workload; // 0..2
+    if (attack_type == ATTACK_ROP)  return 3u;
+    return 4u; // ATTACK_INJ
+}
+
+// ===================== Small memory buffer to generate memory activity =====================
+#define RW_BUF_N 4096
 static uint32_t rw_buf[RW_BUF_N];
 
-// Simulated “ROP-like” anomaly: extra unexpected work + memory-walk
-static inline void simulated_rop_payload(uint32_t level, double fs) {
-    static double tmp[LEN];
+// ===================== Synthetic "ROP-like" anomaly =====================
+__attribute__((noinline)) static uint32_t g1(uint32_t x){ return x * 1664525u + 1013904223u; }
+__attribute__((noinline)) static uint32_t g2(uint32_t x){ return (x << 7) ^ (x >> 3) ^ 0xA5A5A5A5u; }
+__attribute__((noinline)) static uint32_t g3(uint32_t x){ return (x + 0x9E3779B9u) ^ (x * 0x27d4eb2du); }
+__attribute__((noinline)) static uint32_t g4(uint32_t x){ return (x ^ (x >> 16)) * 0x7feb352du; }
+__attribute__((noinline)) static uint32_t g5(uint32_t x){ return (x ^ (x >> 15)) * 0x846ca68bu; }
+__attribute__((noinline)) static uint32_t g6(uint32_t x){ return x ^ (x << 13) ^ (x >> 17) ^ (x << 5); }
+__attribute__((noinline)) static uint32_t g7(uint32_t x){ return (x + 0x3c6ef372u) ^ (x >> 11); }
+__attribute__((noinline)) static uint32_t g8(uint32_t x){ return (x * 0x85ebca6bu) ^ (x >> 13); }
+
+typedef uint32_t (*gfn)(uint32_t);
+static gfn chain[8] = { g1,g2,g3,g4,g5,g6,g7,g8 };
+
+static inline void simulated_rop_anomaly(uint32_t level) {
     if (level == 0) return;
 
-    // extra filtering pass on already-filtered data
-    low_pass_fir(sig_filt, tmp, LEN, lp_coefficients, LPF_ORDER);
+    uint32_t x = (uint32_t)DWT_CYCCNT ^ (uint32_t)time_us_64();
+    int rounds = (level == 1) ? 24 : 48;
 
-    // extra HR computations with different thresholds
-    double hr1 = compute_hr(tmp, LEN, fs, 0.18);
-    double hr2 = compute_hr(tmp, LEN, fs, 0.25);
+    for (int i = 0; i < rounds; i++) {
+        x = chain[(x + (uint32_t)i) & 7u](x);
+        if (x & 1u) x ^= 0xDEADBEEFu;
+    }
 
-    // memory walk (creates LSU/cache pressure)
     uint32_t acc = 0;
-    uint32_t step = (level == 1) ? 17u : 7u;
-    for (uint32_t i = 0; i < RW_BUF_N; i += step) {
-        rw_buf[i] ^= (0x9E3779B9u + i);
-        acc ^= rw_buf[i];
+    int touches = (level == 1) ? 160 : 320;
+
+    for (int i = 0; i < touches; i++) {
+        uint32_t idx = (x ^ (uint32_t)i * 2654435761u) & (RW_BUF_N - 1u);
+        rw_buf[idx] ^= (x + (uint32_t)i);
+        acc ^= rw_buf[idx];
+        x = g6(x + acc);
     }
 
-    if (level >= 2) {
-        // heavier: 2 more passes + more memory touch
-        low_pass_fir(tmp, tmp, LEN, lp_coefficients, LPF_ORDER);
-        (void)compute_hr(tmp, LEN, fs, 0.15);
-
-        for (uint32_t i = 0; i < RW_BUF_N; i += 3u) {
-            rw_buf[i] += (acc ^ i);
-        }
-    }
-
-    __asm volatile("" :: "r"(hr1), "r"(hr2), "r"(acc) : "memory");
+    __asm volatile("" :: "r"(x), "r"(acc) : "memory");
 }
 
-static inline void run_workload_step(int label) {
+// ===================== Synthetic "INJ-like" anomaly =====================
+static inline void simulated_inj_anomaly(uint32_t level) {
+    if (level == 0) return;
+
+    uint32_t x = (uint32_t)time_us_64();
+    int passes = (level == 1) ? 2 : 4;
+
+    for (int p = 0; p < passes; p++) {
+        for (uint32_t i = 0; i < RW_BUF_N; i += 4u) {
+            rw_buf[i]     = (rw_buf[i]     + 0x11111111u) ^ x;
+            rw_buf[i + 1] = (rw_buf[i + 1] + 0x22222222u) ^ (x >> 1);
+            rw_buf[i + 2] = (rw_buf[i + 2] + 0x33333333u) ^ (x >> 2);
+            rw_buf[i + 3] = (rw_buf[i + 3] + 0x44444444u) ^ (x >> 3);
+            x = g1(x);
+        }
+        for (uint32_t i = 0; i + 16u < RW_BUF_N; i += 16u) {
+            rw_buf[i + 8]  ^= rw_buf[i + 0];
+            rw_buf[i + 9]  ^= rw_buf[i + 1];
+            rw_buf[i + 10] ^= rw_buf[i + 2];
+            rw_buf[i + 11] ^= rw_buf[i + 3];
+        }
+        x ^= rw_buf[(x & (RW_BUF_N - 1u))];
+    }
+
+    __asm volatile("" :: "r"(x) : "memory");
+}
+
+// ===================== Workload step =====================
+static inline void run_workload_step(uint32_t workload_label) {
     const double fs = 250.0;
 
-    if (label == 0) generate_light_signal(fs);
-    else if (label == 1) generate_medium_signal(fs);
+    if (workload_label == 0) generate_light_signal(fs);
+    else if (workload_label == 1) generate_medium_signal(fs);
     else generate_heavy_signal(fs);
 
+    // baseline filtering
     low_pass_fir(sig_in, sig_filt, LEN, lp_coefficients, LPF_ORDER);
 
-    if (label == 1) {
+    // workload-specific extra work
+    if (workload_label == 1) {
         low_pass_fir(sig_filt, sig_filt, LEN, lp_coefficients, LPF_ORDER);
-    } else if (label == 2) {
+    } else if (workload_label == 2) {
         for (int k = 0; k < 3; ++k) low_pass_fir(sig_filt, sig_filt, LEN, lp_coefficients, LPF_ORDER);
+    }
+
+    // SAFE variability (ώστε το "normal" να έχει ποικιλία)
+    // μικρή πιθανότητα για extra FIR pass σε SAFE μόνο:
+    if (current_attack_type == ATTACK_NONE) {
+        if ((rand() % 10) == 0) { // 10% chance
+            low_pass_fir(sig_filt, sig_filt, LEN, lp_coefficients, LPF_ORDER);
+        }
     }
 
     hr_sink += compute_hr(sig_filt, LEN, fs, 0.2);
 
-    // simulated "attack" work (if enabled)
+    // anomaly work during attack
     if (current_attack_type == ATTACK_ROP) {
-        simulated_rop_payload(current_attack_level, fs);
+        simulated_rop_anomaly(current_attack_level);
+    } else if (current_attack_type == ATTACK_INJ) {
+        simulated_inj_anomaly(current_attack_level);
     }
 
-    // make LIGHT a bit more idle
-    if (label == 0) sleep_ms(2);
+    // LIGHT: jittered idle αντί για fixed sleep (μειώνει leakage/υπερ-εύκολη ταξινόμηση)
+    if (workload_label == 0) {
+        sleep_ms(1 + (rand() % 3)); // 1..3ms
+    }
 }
 
 // ===================== Aggregator (2ms oversampling) =====================
@@ -250,14 +319,17 @@ typedef struct {
     uint32_t device_id;
     uint32_t window_id;
 
-    // labels (structured)
+    // NEW: bucket id (για group split στο training)
+    uint32_t bucket_id;
+
+    // labels
     uint32_t workload;       // 0/1/2
-    uint32_t attack_type;    // 0=none, 1=rop
+    uint32_t attack_type;    // enum
     uint32_t attack_level;   // 0/1/2
     uint32_t compromised;    // 0/1
 
-    // optional single-class label
-    uint32_t class_id;
+    // leaf label
+    uint32_t leaf_label;     // 0..4
 
     // raw aggregates
     uint32_t dC, dL, dP, dE, dF, dS, dT;
@@ -274,11 +346,13 @@ typedef struct {
 static sample_t ring[RING_N];
 static volatile uint32_t w_idx = 0;
 static volatile uint32_t r_idx = 0;
+static volatile uint32_t dropped_ring_pushes = 0;
 
 static inline bool ring_push(const sample_t *s) {
     uint32_t irq = save_and_disable_interrupts();
     uint32_t next = (w_idx + 1u) % RING_N;
     if (next == r_idx) {
+        dropped_ring_pushes++;
         restore_interrupts(irq);
         return false;
     }
@@ -300,9 +374,18 @@ static inline bool ring_pop(sample_t *out) {
     return true;
 }
 
-// ===================== Global labels/window =====================
-static volatile uint32_t current_workload = 0;
+static inline void ring_reset(void) {
+    uint32_t irq = save_and_disable_interrupts();
+    w_idx = r_idx = 0;
+    restore_interrupts(irq);
+}
+
+// ===================== Global ids =====================
 static volatile uint32_t window_id_g = 0;
+static volatile uint32_t bucket_id_g = 0;
+
+// current bucket id (latched into samples)
+static volatile uint32_t current_bucket_id = 0;
 
 // ===================== 2ms callback: oversample DWT =====================
 bool timer_2ms_cb(struct repeating_timer *t) {
@@ -357,12 +440,13 @@ bool timer_100ms_cb(struct repeating_timer *t) {
     sample_t s = {0};
     s.device_id   = DEVICE_ID;
     s.window_id   = window_id_g++;
+    s.bucket_id   = current_bucket_id;
 
     s.workload    = current_workload;
     s.attack_type = (uint32_t)current_attack_type;
     s.attack_level= current_attack_level;
     s.compromised = compromised_flag();
-    s.class_id    = class_id(s.workload, s.attack_type, s.attack_level);
+    s.leaf_label  = leaf_label(s.workload, s.attack_type);
 
     s.dT = a.sum_dt_us;
     s.dC = a.sum_cyc;
@@ -382,19 +466,35 @@ bool timer_100ms_cb(struct repeating_timer *t) {
     return true;
 }
 
-// ===================== main =====================
-int main(void) {
-    stdio_init_all();
-    wait_for_usb_connection();
+// ===================== Timer control =====================
+static struct repeating_timer t2ms;
+static struct repeating_timer t100ms;
+static bool timers_running = false;
 
-    srand((unsigned)time_us_64());
+static void start_timers(void) {
+    if (timers_running) return;
+    add_repeating_timer_ms(-2,   timer_2ms_cb,   NULL, &t2ms);
+    add_repeating_timer_ms(-100, timer_100ms_cb, NULL, &t100ms);
+    timers_running = true;
+}
 
-    // init rw_buf
-    for (uint32_t i = 0; i < RW_BUF_N; i++) rw_buf[i] = (0xA5A5A5A5u ^ i);
+static void stop_timers(void) {
+    if (!timers_running) return;
+    cancel_repeating_timer(&t2ms);
+    cancel_repeating_timer(&t100ms);
+    timers_running = false;
+}
 
-    dwt_enable_all();
+// Reset sampling state so printing time doesn't contaminate next bucket
+static void reset_sampling_state(void) {
+    uint32_t irq = save_and_disable_interrupts();
+    agg = (agg_t){0};
+    restore_interrupts(irq);
 
-    // init prevs
+    ring_reset();
+
+    dwt_reset_event_counters();
+
     prev_t_us = time_us_64();
     prev_cyc  = DWT_CYCCNT;
 
@@ -403,80 +503,114 @@ int main(void) {
     prev_exc8   = (uint8_t)DWT_EXCCNT;
     prev_fold8  = (uint8_t)DWT_FOLDCNT;
     prev_sleep8 = (uint8_t)DWT_SLEEPCNT;
+}
 
-    // CSV header (now includes class_id)
-    printf("device_id,window_id,workload,attack_type,attack_level,compromised,class_id,"
+// ===================== Collection / Dump (NO printf during collection) =====================
+static sample_t bucket_buf[SAMPLES_PER_BUCKET];
+
+static void dump_bucket(const sample_t *buf, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        const sample_t *s = &buf[i];
+        // CSV: added bucket_id after window_id
+        printf("%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+               s->device_id, s->window_id, s->bucket_id,
+               s->workload, s->attack_type, s->attack_level, s->compromised, s->leaf_label,
+               s->dC, s->dL, s->dP, s->dE, s->dF, s->dS, s->dT,
+               s->cyc_per_us, s->lsu_per_cyc, s->cpi_per_cyc, s->exc_per_cyc, s->fold_per_cyc);
+    }
+}
+
+static void collect_exact_samples(uint32_t target_n) {
+    uint32_t collected = 0;
+
+    while (collected < target_n) {
+        run_workload_step(current_workload);
+
+        sample_t s;
+        while (collected < target_n && ring_pop(&s)) {
+            bucket_buf[collected++] = s;
+        }
+    }
+}
+
+static void run_bucket(uint32_t workload, attack_t atk, uint32_t level, uint32_t n) {
+    // assign a new bucket id (important for group split)
+    current_bucket_id = bucket_id_g++;
+
+    // labels for this bucket
+    current_workload     = workload;
+    current_attack_type  = atk;
+    current_attack_level = level;
+
+    // collect without printing
+    collect_exact_samples(n);
+
+    // stop, dump, reset, restart
+    stop_timers();
+    dump_bucket(bucket_buf, n);
+
+    reset_sampling_state();
+    start_timers();
+}
+
+// ===================== main =====================
+int main(void) {
+    stdio_init_all();
+    wait_for_usb_connection();
+
+    srand((unsigned)time_us_64());
+
+    for (uint32_t i = 0; i < RW_BUF_N; i++) rw_buf[i] = (0xA5A5A5A5u ^ i);
+
+    dwt_enable_all();
+    reset_sampling_state();
+
+    // CSV header
+    printf("device_id,window_id,bucket_id,workload,attack_type,attack_level,compromised,leaf_label,"
            "dC,dL,dP,dE,dF,dS,dT,cyc_per_us,lsu_per_cyc,cpi_per_cyc,exc_per_cyc,fold_per_cyc\n");
 
-    // timers
-    struct repeating_timer t2ms, t100ms;
-    add_repeating_timer_ms(-2,   timer_2ms_cb,   NULL, &t2ms);
-    add_repeating_timer_ms(-100, timer_100ms_cb, NULL, &t100ms);
+    start_timers();
 
-    const uint32_t windows_per_bucket = 300;
-
-    // ------------------------------------------
-    // SAFE: (workload=0/1/2, attack=none)
-    // ------------------------------------------
-    for (uint32_t w = 0; w < 3; w++) {
-        current_workload = w;
-        current_attack_type  = ATTACK_NONE;
-        current_attack_level = 0;
-
-        uint32_t end_window = window_id_g + windows_per_bucket;
-        while (window_id_g < end_window) {
-            run_workload_step((int)current_workload);
-
-            sample_t s;
-            while (ring_pop(&s)) {
-                printf("%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f\n",
-                       s.device_id, s.window_id,
-                       s.workload, s.attack_type, s.attack_level, s.compromised, s.class_id,
-                       s.dC, s.dL, s.dP, s.dE, s.dF, s.dS, s.dT,
-                       s.cyc_per_us, s.lsu_per_cyc, s.cpi_per_cyc, s.exc_per_cyc, s.fold_per_cyc);
-            }
-        }
+    // --------------------------
+    // SAFE buckets (more + varied)
+    // leaf_label = 0/1/2
+    // --------------------------
+    for (int r = 0; r < SAFE_REPEATS; r++) {
+        run_bucket(0, ATTACK_NONE, 0, SAMPLES_PER_BUCKET);
+        run_bucket(1, ATTACK_NONE, 0, SAMPLES_PER_BUCKET);
+        run_bucket(2, ATTACK_NONE, 0, SAMPLES_PER_BUCKET);
     }
 
-    // ------------------------------------------
-    // ROP: ALL workloads × BOTH intensity levels
-    // (w=0/1/2) × (level=1/2)
-    // ------------------------------------------
-    for (uint32_t w = 0; w < 3; w++) {
-        for (uint32_t lvl = 1; lvl <= 2; lvl++) {
-            current_workload = w;
-            current_attack_type  = ATTACK_ROP;
-            current_attack_level = lvl;
+    // --------------------------
+    // ROP buckets: vary workload and level
+    // leaf_label = 3
+    // --------------------------
+    run_bucket(0, ATTACK_ROP, 1, SAMPLES_PER_BUCKET);
+    run_bucket(1, ATTACK_ROP, 1, SAMPLES_PER_BUCKET);
+    run_bucket(2, ATTACK_ROP, 1, SAMPLES_PER_BUCKET);
 
-            uint32_t end_window = window_id_g + windows_per_bucket;
-            while (window_id_g < end_window) {
-                run_workload_step((int)current_workload);
+    run_bucket(0, ATTACK_ROP, 2, SAMPLES_PER_BUCKET);
+    run_bucket(1, ATTACK_ROP, 2, SAMPLES_PER_BUCKET);
+    run_bucket(2, ATTACK_ROP, 2, SAMPLES_PER_BUCKET);
 
-                sample_t s;
-                while (ring_pop(&s)) {
-                    printf("%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f\n",
-                           s.device_id, s.window_id,
-                           s.workload, s.attack_type, s.attack_level, s.compromised, s.class_id,
-                           s.dC, s.dL, s.dP, s.dE, s.dF, s.dS, s.dT,
-                           s.cyc_per_us, s.lsu_per_cyc, s.cpi_per_cyc, s.exc_per_cyc, s.fold_per_cyc);
-                }
-            }
-        }
-    }
+    // --------------------------
+    // INJ buckets
+    // leaf_label = 4
+    // --------------------------
+    run_bucket(0, ATTACK_INJ, 1, SAMPLES_PER_BUCKET);
+    run_bucket(1, ATTACK_INJ, 1, SAMPLES_PER_BUCKET);
+    run_bucket(2, ATTACK_INJ, 1, SAMPLES_PER_BUCKET);
 
-    // drain
-    sample_t s;
-    while (ring_pop(&s)) {
-        printf("%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f\n",
-               s.device_id, s.window_id,
-               s.workload, s.attack_type, s.attack_level, s.compromised, s.class_id,
-               s.dC, s.dL, s.dP, s.dE, s.dF, s.dS, s.dT,
-               s.cyc_per_us, s.lsu_per_cyc, s.cpi_per_cyc, s.exc_per_cyc, s.fold_per_cyc);
-    }
+    run_bucket(0, ATTACK_INJ, 2, SAMPLES_PER_BUCKET);
+    run_bucket(1, ATTACK_INJ, 2, SAMPLES_PER_BUCKET);
+    run_bucket(2, ATTACK_INJ, 2, SAMPLES_PER_BUCKET);
 
-    cancel_repeating_timer(&t2ms);
-    cancel_repeating_timer(&t100ms);
+    stop_timers();
 
-    printf("DONE\n");
+    // diagnostics as comment lines (CSV-safe if you ignore lines starting with '#')
+    printf("# DONE\n");
+    printf("# dropped_ring_pushes=%u\n", (unsigned)dropped_ring_pushes);
+    printf("# total_buckets=%u\n", (unsigned)bucket_id_g);
+
     while (1) sleep_ms(1000);
 }

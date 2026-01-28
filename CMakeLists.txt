@@ -243,3 +243,85 @@ target_compile_definitions(lp_every_100ms_wifi PRIVATE
 pico_add_extra_outputs(lp_every_100ms_wifi)
 
 
+##NEW
+
+add_executable(lp_100ms_wifi_rop
+    lp_100ms_wifi_rop.c
+    sha256.c
+)
+
+target_link_libraries(lp_100ms_wifi_rop
+    pico_stdlib
+    pico_cyw43_arch_lwip_threadsafe_background
+    hardware_timer
+    hardware_sync
+)
+
+target_include_directories(lp_100ms_wifi_rop PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}
+)
+
+pico_enable_stdio_usb(lp_100ms_wifi_rop 1)
+pico_enable_stdio_uart(lp_100ms_wifi_rop 0)
+
+target_compile_definitions(lp_100ms_wifi_rop PRIVATE
+    WIFI_SSID=\"${WIFI_SSID}\"
+    WIFI_PASSWORD=\"${WIFI_PASSWORD}\"
+    VERIFIER_IP=\"192.168.68.102\"
+    VERIFIER_PORT=4242
+)
+
+pico_add_extra_outputs(lp_100ms_wifi_rop)
+
+
+
+
+add_executable(lp_interr_storm
+ lp_interr_storm.c
+)
+
+target_link_libraries(lp_interr_storm pico_stdlib)
+pico_enable_stdio_usb(lp_interr_storm 1)
+pico_enable_stdio_uart(lp_interr_storm 0)
+pico_add_extra_outputs(lp_interr_storm
+)
+
+add_executable(lp_inj
+ lp_inj.c
+)
+
+target_link_libraries(lp_inj pico_stdlib)
+pico_enable_stdio_usb(lp_inj 1)
+pico_enable_stdio_uart(lp_inj 0)
+pico_add_extra_outputs(lp_inj
+)
+
+
+#NEW FOR SECOND DEVICE 
+add_executable(fft_100ms_wifi
+    fft_100ms_wifi.c
+    sha256.c
+)
+
+target_link_libraries(fft_100ms_wifi
+    pico_stdlib
+    pico_cyw43_arch_lwip_threadsafe_background
+    hardware_timer
+    hardware_sync
+)
+
+target_include_directories(fft_100ms_wifi PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}
+)
+
+pico_enable_stdio_usb(fft_100ms_wifi 1)
+pico_enable_stdio_uart(fft_100ms_wifi 0)
+
+target_compile_definitions(fft_100ms_wifi PRIVATE
+    WIFI_SSID=\"${WIFI_SSID}\"
+    WIFI_PASSWORD=\"${WIFI_PASSWORD}\"
+    VERIFIER_IP=\"192.168.68.102\"
+    VERIFIER_PORT=4242
+)
+
+pico_add_extra_outputs(fft_100ms_wifi)
