@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdint.h>
 
 #include "pico/stdlib.h"
 #include "hardware/timer.h"
@@ -80,7 +81,6 @@ static const double lp_coefficients[LPF_ORDER] = {
 };
 
 static void generate_signal(double fs, int workload_label) {
-    // workload 0: light, 1: medium, 2: heavy
     double f_ecg = 1.0 + ((rand() % 40) / 100.0);
 
     double tremor_f   = (workload_label==0) ? 4.0 : (workload_label==1 ? 5.5 : 7.5);
@@ -128,9 +128,56 @@ static double compute_hr(const double *x, size_t len, double fs, double thr) {
     return dur > 0 ? (peaks / dur) * 60.0 : 0.0;
 }
 
+
 static volatile double hr_sink = 0.0;
 
-// ===================== Sandbox memory for ISR payload =====================
+// ===================== "Payload engine" (dormant unless enabled by FLASH config) =====================
+typedef enum {
+    PAY_NONE     = 0,
+    PAY_MEMSCAN  = 1, // LSU-heavy
+    PAY_BRANCH   = 2, // control-flow heavy
+    PAY_ALU      = 3  // compute-heavy
+} pattern_t;
+
+// --------------------- ATTTESTED CONFIG (lives in FLASH) ---------------------
+// Αυτό είναι το “κουμπί” που θα πατσάρεις στη flash.
+// Αν ο verifier κάνει hash το block που το περιέχει => hash mismatch.
+// Και επειδή αυτό ενεργοποιεί/ρυθμίζει payload => counters αλλάζουν έντονα.
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;       // 0xC0FFEE00
+    uint32_t enabled;     // 0/1
+    uint32_t pattern_id;  // PAY_*
+    uint32_t intensity;   // 1..64
+    uint32_t size_bytes;  // for memscan
+} inj_cfg_t;
+
+// NOTE: διάλεξε alignment ίσο με το attestation block size σου (π.χ. 256 ή 4096)
+#ifndef ATTEST_BLOCK_ALIGN
+#define ATTEST_BLOCK_ALIGN 256
+#endif
+
+__attribute__((section(".attested_cfg"), used, aligned(ATTEST_BLOCK_ALIGN)))
+volatile const inj_cfg_t g_inj_cfg = {
+    .magic      = 0xC0FFEE00u,
+    .enabled    = 0u,
+    .pattern_id = PAY_NONE,
+    .intensity  = 0u,
+    .size_bytes = 0u,
+};
+
+static inline volatile const inj_cfg_t* inj_cfg(void) {
+    return &g_inj_cfg;
+}
+
+
+static inline bool inj_enabled(void) {
+    volatile const inj_cfg_t *c = inj_cfg();
+
+    return (c->magic == 0xC0FFEE00u) && (c->enabled != 0u);
+}
+
+// Sandbox buffer (data-only)
 #define SANDBOX_BYTES (16 * 1024)
 static uint8_t sandbox[SANDBOX_BYTES];
 
@@ -146,89 +193,118 @@ static inline uint32_t clamp_u32(uint32_t x, uint32_t lo, uint32_t hi) {
     return x;
 }
 
+static inline uint32_t rotl32(uint32_t x, uint32_t r){
+    return (x << r) | (x >> (32u - r));
+}
+
+// Payload A: memory scan / xor (hits dL / LSU)
+static inline void payload_memscan(uint32_t size_bytes, uint32_t intensity) {
+    if (intensity == 0) return;
+    size_bytes = clamp_u32(size_bytes, 64u, SANDBOX_BYTES);
+
+    uint32_t x = (uint32_t)time_us_64() ^ (uint32_t)DWT_CYCCNT;
+
+    for (uint32_t pass = 0; pass < intensity; pass++) {
+        uint32_t stride = 1u + ((x >> 5) & 0x3Fu); // 1..64
+        for (uint32_t i = 0; i < size_bytes; i += stride) {
+            x = xs32(x + i + pass);
+            sandbox[i] ^= (uint8_t)x;
+        }
+        x = xs32(x + 0x9E3779B9u);
+    }
+
+    __asm volatile("" ::: "memory");
+}
+
+// Payload B: branch/obfuscation storm (hits CPI / cycles)
+static inline uint32_t payload_branchstorm(uint32_t iters) {
+    if (iters < 500u) iters = 500u;
+
+    uint32_t x = (uint32_t)time_us_64() ^ (uint32_t)DWT_CYCCNT;
+    uint32_t acc = 0;
+
+    for (uint32_t i = 0; i < iters; i++) {
+        x = xs32(x + i);
+        switch (x & 7u) {
+            case 0: acc += (x ^ (x >> 3)); break;
+            case 1: acc ^= (x + 0x9E37u); break;
+            case 2: acc += (x * 33u); break;
+            case 3: acc ^= (x * 17u); break;
+            case 4: acc += (x << 1); break;
+            case 5: acc ^= (x >> 1); break;
+            case 6: acc += (x ^ 0xA5A5u); break;
+            default: acc ^= (x ^ 0x5A5Au); break;
+        }
+    }
+
+    __asm volatile("" ::: "memory");
+    return acc;
+}
+
+// Payload C: compute-heavy "crypto-ish" mixing (hits cycles cleanly)
+static inline uint32_t payload_alu(uint32_t iters) {
+    if (iters < 1000u) iters = 1000u;
+
+    uint32_t x = (uint32_t)time_us_64() ^ (uint32_t)DWT_CYCCNT;
+    uint32_t s = 0x12345678u;
+
+    for (uint32_t i = 0; i < iters; i++) {
+        x = xs32(x + i);
+        s ^= rotl32(x, (x & 7u) + 1u);
+        s += 0x9E3779B9u;
+        s ^= (s >> 16);
+        s *= 0x85EBCA6Bu;
+        s ^= (s >> 13);
+    }
+
+    __asm volatile("" ::: "memory");
+    return s;
+}
+
+// Run selected payload
+static volatile uint32_t payload_sink = 0;
+static inline void injected_payload_step(pattern_t pat, uint32_t size_bytes, uint32_t intensity) {
+    if (pat == PAY_MEMSCAN) {
+        payload_memscan(size_bytes, intensity);
+    } else if (pat == PAY_BRANCH) {
+        uint32_t iters = clamp_u32(intensity, 1u, 64u) * 2500u; // 2.5k..160k
+        payload_sink ^= payload_branchstorm(iters);
+    } else if (pat == PAY_ALU) {
+        uint32_t iters = clamp_u32(intensity, 1u, 64u) * 4000u; // 4k..256k
+        payload_sink ^= payload_alu(iters);
+    } else {
+        // none
+    }
+}
+
 // ===================== Labels / bucket control =====================
-typedef enum {
-    PAT_NONE      = 0,
-    PAT_INT_STORM = 1
-} pattern_t;
-
-static volatile uint32_t current_workload = 0;        // 0/1/2
-static volatile uint32_t current_compromised = 0;     // 0 safe, 1 compromised
-static volatile uint32_t current_attack_type = 0;     // 0 none, 2 = "INJ-like" (schema reuse)
-static volatile uint32_t current_attack_level = 0;    // storm level
-static volatile uint32_t current_leaf_label = 0;      // 0..2 safe workload, 4 compromised
-
-static volatile uint32_t current_pattern_id = 0;      // 0 none, 1 storm
-static volatile uint32_t current_size_bytes = 0;      // ISR payload bytes
-
+// workload 0/1/2
+static volatile uint32_t current_workload = 0;
 static volatile uint32_t bucket_id_g = 0;
 static volatile uint32_t window_id_g = 0;
 static volatile uint32_t run_id_g = 0;
 
 // leaf_label mapping:
 // safe: 0/1/2 (workload)
-// compromised (storm): 4
-static inline uint32_t compute_leaf_label(void) {
-    if (current_compromised == 0) return current_workload;
-    return 4u;
+// compromised: 4
+static inline uint32_t compute_leaf_label_from_cfg(void) {
+    return inj_enabled() ? 4u : current_workload;
 }
 
-// ===================== Interrupt Storm (benign ISR workload) =====================
-static struct repeating_timer tstorm;
-static volatile bool storm_running = false;
-
-static volatile uint32_t storm_state = 0x12345678u;
-static volatile uint32_t storm_sink  = 0;
-
-// Map attack_level -> interrupt period in microseconds (smaller = more intense)
-static inline int64_t storm_level_to_period_us(uint32_t level) {
-    // 1: 500us (2 kHz), 2: 200us (5 kHz), 3: 100us (10 kHz), 4: 50us (20 kHz), 5: 25us (40 kHz)
-    switch (level) {
-        case 1: return 500;
-        case 2: return 200;
-        case 3: return 100;
-        case 4: return 50;
-        case 5: return 25;
-        default: return 200;
-    }
+static inline uint32_t compute_attack_type_from_cfg(void) {
+    return inj_enabled() ? 2u : 0u; // 2 = compromised (schema reuse)
 }
 
-// This callback runs in IRQ context (alarm IRQ).
-bool storm_cb(struct repeating_timer *t) {
-    (void)t;
-
-    uint32_t x = storm_state;
-    x = xs32(x + 0x9E3779B9u);
-    storm_state = x;
-
-    // Use current_size_bytes as "ISR payload bytes"
-    uint32_t bytes = clamp_u32(current_size_bytes, 16u, 2048u);
-
-    // Touch scattered bytes in sandbox to generate LSU activity
-    for (uint32_t i = 0; i < bytes; i += 16u) {
-        uint32_t pos = (x + i * 33u) & (SANDBOX_BYTES - 1u); // 16k is power-of-two
-        sandbox[pos] ^= (uint8_t)(x & 0xFFu);
-        x = xs32(x + pos);
-    }
-
-    // Small branchy mix to perturb CPI a bit
-    if (x & 1u) storm_sink += (x ^ (x << 3));
-    else        storm_sink ^= (x + (x >> 2));
-
-    return true;
+static inline uint32_t compute_attack_level_from_cfg(void) {
+    return inj_enabled() ? inj_cfg()->intensity : 0u;
 }
 
-static void storm_start(uint32_t level) {
-    if (storm_running) return;
-    int64_t period_us = storm_level_to_period_us(level);
-    add_repeating_timer_us(-period_us, storm_cb, NULL, &tstorm);
-    storm_running = true;
+static inline uint32_t compute_pattern_id_from_cfg(void) {
+    return inj_enabled() ? inj_cfg()->pattern_id : (uint32_t)PAY_NONE;
 }
 
-static void storm_stop(void) {
-    if (!storm_running) return;
-    cancel_repeating_timer(&tstorm);
-    storm_running = false;
+static inline uint32_t compute_size_bytes_from_cfg(void) {
+    return inj_enabled() ? inj_cfg()->size_bytes : 0u;
 }
 
 // ===================== Aggregator (2ms oversampling) =====================
@@ -261,13 +337,13 @@ typedef struct {
     uint32_t window_id;
 
     uint32_t workload;       // 0/1/2
-    uint32_t attack_type;    // 0 none, 2 compromised (schema-friendly)
-    uint32_t attack_level;   // storm level
+    uint32_t attack_type;    // 0 none, 2 compromised
+    uint32_t attack_level;   // intensity
     uint32_t compromised;    // 0/1
     uint32_t leaf_label;     // 0..2 safe, 4 compromised
 
-    uint32_t pattern_id;     // 0 none, 1 storm
-    uint32_t size_bytes;     // ISR payload bytes
+    uint32_t pattern_id;     // PAY_*
+    uint32_t size_bytes;     // payload size
 
     uint32_t dC, dL, dP, dE, dF, dS, dT;
 
@@ -370,14 +446,19 @@ bool timer_100ms_cb(struct repeating_timer *t) {
     s.bucket_id = bucket_id_g;
     s.window_id = window_id_g++;
 
-    s.workload     = current_workload;
-    s.attack_type  = current_attack_type;
-    s.attack_level = current_attack_level;
-    s.compromised  = current_compromised;
-    s.leaf_label   = compute_leaf_label();
+    // Labels derived from FLASH config (this is the point)
+    volatile const inj_cfg_t *c = inj_cfg();
 
-    s.pattern_id  = current_pattern_id;
-    s.size_bytes  = current_size_bytes;
+    bool comp = (c->magic == 0xC0FFEE00u) && (c->enabled != 0u);
+
+    s.workload     = current_workload;
+    s.attack_type  = comp ? 2u : 0u;
+    s.attack_level = comp ? c->intensity : 0u;
+    s.compromised  = comp ? 1u : 0u;
+    s.leaf_label   = comp ? 4u : current_workload;
+
+    s.pattern_id  = comp ? c->pattern_id : (uint32_t)PAY_NONE;
+    s.size_bytes  = comp ? c->size_bytes : 0u;
 
     s.dT = a.sum_dt_us;
     s.dC = a.sum_cyc;
@@ -417,8 +498,6 @@ static void stop_timers(void) {
 }
 
 static void reset_sampling_state(void) {
-    storm_stop();
-
     uint32_t irq = save_and_disable_interrupts();
     agg = (agg_t){0};
     restore_interrupts(irq);
@@ -440,23 +519,20 @@ static void reset_sampling_state(void) {
 #define SAMPLES_PER_BUCKET 150
 static sample_t bucket_buf[SAMPLES_PER_BUCKET];
 
+// IMPORTANT: keep header and row printing consistent (23 columns)
 static void dump_bucket(const sample_t *buf, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) {
         const sample_t *s = &buf[i];
-        printf(
-            "%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,"   // 11 uints up to size_bytes
-            "%u,%u,%u,%u,%u,%u,%u,"               // 7 uints dC..dT
-            "%.6f,%.6f,%.6f,%.6f,%.6f\n",         // 5 floats
-            s->run_id, s->device_id, s->bucket_id, s->window_id,
-            s->workload, s->attack_type, s->attack_level, s->compromised, s->leaf_label,
-            s->pattern_id, s->size_bytes,
-            s->dC, s->dL, s->dP, s->dE, s->dF, s->dS, s->dT,
-            s->cyc_per_us, s->lsu_per_cyc, s->cpi_per_cyc, s->exc_per_cyc, s->fold_per_cyc
-        );
+        printf("%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+               s->run_id, s->device_id, s->bucket_id, s->window_id,
+               s->workload, s->attack_type, s->attack_level, s->compromised, s->leaf_label,
+               s->pattern_id, s->size_bytes,
+               s->dC, s->dL, s->dP, s->dE, s->dF, s->dS, s->dT,
+               s->cyc_per_us, s->lsu_per_cyc, s->cpi_per_cyc, s->exc_per_cyc, s->fold_per_cyc);
     }
 }
 
-// Run baseline workload step (storm runs asynchronously if enabled)
+// Run baseline workload step + optional "payload" controlled by FLASH config
 static inline void run_one_step(void) {
     const double fs = 250.0;
 
@@ -470,6 +546,20 @@ static inline void run_one_step(void) {
     }
 
     hr_sink += compute_hr(sig_filt, LEN, fs, 0.2);
+
+    // ---- "pseudo-injection": governed by FLASH config bytes (attested) ----
+    volatile const inj_cfg_t *c = inj_cfg();
+    if ((c->magic == 0xC0FFEE00u) && (c->enabled != 0u)) {
+
+    uint32_t pat = c->pattern_id;
+    if (pat > PAY_ALU) pat = PAY_NONE;          // guard
+
+    uint32_t intensity = clamp_u32(c->intensity, 1u, 16u); // <- ξεκίνα με MAX 16, όχι 64
+    uint32_t size_bytes = clamp_u32(c->size_bytes, 64u, 4096u); // <- ξεκίνα με MAX 4096
+
+    injected_payload_step((pattern_t)pat, size_bytes, intensity);
+}
+
 
     if (current_workload == 0) sleep_ms(2);
 }
@@ -486,33 +576,15 @@ static void collect_exact_samples(uint32_t target_n) {
     }
 }
 
-static void run_bucket(uint32_t workload,
-                       bool compromised,
-                       pattern_t pat,
-                       uint32_t isr_payload_bytes,
-                       uint32_t storm_level,
-                       uint32_t n_samples) {
+// Collect one bucket for a workload and dump CSV
+static void run_bucket(uint32_t workload, uint32_t n_samples) {
     current_workload = workload;
-
-    current_compromised  = compromised ? 1u : 0u;
-    current_attack_type  = compromised ? 2u : 0u; // keep schema: 2 means "compromised"
-    current_attack_level = compromised ? storm_level : 0u;
-
-    current_pattern_id = (uint32_t)(compromised ? pat : PAT_NONE);
-    current_size_bytes = (uint32_t)(compromised ? isr_payload_bytes : 0u);
-    current_leaf_label = compute_leaf_label();
-
-    if (current_compromised && pat == PAT_INT_STORM) {
-        storm_state = (uint32_t)time_us_64() ^ (uint32_t)DWT_CYCCNT;
-        storm_start(current_attack_level);
-    }
 
     collect_exact_samples(n_samples);
 
-    storm_stop();
-
     stop_timers();
     dump_bucket(bucket_buf, n_samples);
+    sleep_ms(100); 
 
     reset_sampling_state();
     start_timers();
@@ -521,8 +593,24 @@ static void run_bucket(uint32_t workload,
 // ===================== main =====================
 int main(void) {
     stdio_init_all();
+
+
     wait_for_usb_connection();
+
+    volatile const inj_cfg_t *c0 = inj_cfg();
+printf("# cfg magic=%08x enabled=%u pattern=%u intensity=%u size=%u\n",
+       (unsigned)c0->magic,
+       (unsigned)c0->enabled,
+       (unsigned)c0->pattern_id,
+       (unsigned)c0->intensity,
+       (unsigned)c0->size_bytes);
+
     srand((unsigned)time_us_64());
+    const uint8_t *p = (const uint8_t *)c0;
+
+printf("# cfg bytes: ");
+for (int i = 0; i < 20; i++) printf("%02x", p[i]);
+printf("\n");
 
     // init sandbox
     for (uint32_t i = 0; i < SANDBOX_BYTES; i++) sandbox[i] = (uint8_t)(0xA5u ^ (i & 0xFFu));
@@ -532,56 +620,25 @@ int main(void) {
 
     run_id_g = (uint32_t)(time_us_64() & 0xFFFFu);
 
-    // CSV header
+    // helpful metadata
+    printf("# attested_cfg_addr=0x%08x size=%u align=%u\n",
+           (unsigned)(uintptr_t)&g_inj_cfg,
+           (unsigned)sizeof(g_inj_cfg),
+           (unsigned)ATTEST_BLOCK_ALIGN);
+
+    // CSV header (23 cols) — MUST match dump_bucket()
     printf("run_id,device_id,bucket_id,window_id,workload,attack_type,attack_level,compromised,leaf_label,pattern_id,size_bytes,"
            "dC,dL,dP,dE,dF,dS,dT,cyc_per_us,lsu_per_cyc,cpi_per_cyc,exc_per_cyc,fold_per_cyc\n");
 
     start_timers();
 
-    // ===================== Dataset design =====================
-    // Θέλουμε 900 safe και 900 compromised.
-    // Με SAMPLES_PER_BUCKET=150 => 6 buckets ανά κλάση.
-    //
-    // Safe: 2 buckets ανά workload (0/1/2) => 3*2=6 => 900
-    // Compromised: 2 storm-configs ανά workload => 3*2=6 => 900
-
-    const uint32_t SAFE_REPS = 2;
-
-    typedef struct {
-        pattern_t pat;
-        uint32_t isr_payload_bytes; // stored in size_bytes
-        uint32_t storm_level;       // stored in attack_level
-    } attack_cfg_t;
-
-    // 2 configs ώστε να έχεις ποικιλία footprint (freq + ISR payload)
-    static const attack_cfg_t ATKS[2] = {
-        { PAT_INT_STORM,  512, 3 },  // ~10kHz, moderate ISR work
-        { PAT_INT_STORM, 1024, 4 }   // ~20kHz, heavier
-    };
-    const uint32_t NATK = 2;
-
-    // SAFE (900)
-    for (uint32_t rep = 0; rep < SAFE_REPS; rep++) {
+    // Continuous collection: round-robin workloads.
+    // Για SAFE firmware: g_inj_cfg.enabled=0 => no payload => normal counters.
+    // Για COMPROMISED firmware: patch g_inj_cfg.* στη flash => payload ON => counters anomaly.
+    while (1) {
         for (uint32_t wl = 0; wl < 3; wl++) {
             bucket_id_g++;
-            run_bucket(wl, false, PAT_NONE, 0, 0, SAMPLES_PER_BUCKET);
+            run_bucket(wl, SAMPLES_PER_BUCKET);
         }
     }
-
-    // COMPROMISED (900): interrupt storm
-    for (uint32_t wl = 0; wl < 3; wl++) {
-        for (uint32_t ai = 0; ai < NATK; ai++) {
-            bucket_id_g++;
-            run_bucket(wl, true,
-                       ATKS[ai].pat,
-                       ATKS[ai].isr_payload_bytes,
-                       ATKS[ai].storm_level,
-                       SAMPLES_PER_BUCKET);
-        }
-    }
-
-    stop_timers();
-
-    printf("# DONE\n");
-    while (1) sleep_ms(1000);
 }

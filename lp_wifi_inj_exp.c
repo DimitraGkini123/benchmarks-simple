@@ -12,6 +12,19 @@
 #include "sha256.h"
 #include "pico/stdlib.h"
 #include "hardware/timer.h"
+#ifndef INJECT_PAYLOAD_HEADER
+#define INJECT_PAYLOAD_HEADER "inject_payload_zero.h"
+#endif
+#include INJECT_PAYLOAD_HEADER
+
+
+// ===================== STATIC INJECTION KNOB =====================
+
+#define MAX_INJECT 8192
+
+__attribute__((used, section(".rodata.inject")))
+static const uint8_t injected_blob[MAX_INJECT] = INJECT_PAYLOAD_INIT;
+
 
 // ===================== DWT registers =====================
 #define DEMCR                (*(volatile uint32_t *)0xE000EDFC)
@@ -34,17 +47,17 @@
 #define DWT_CTRL_LSUEVTENA   (1u << 20)
 #define DWT_CTRL_FOLDEVTENA  (1u << 21)
 
-#define DEVICE_ID 2
+#define DEVICE_ID 1
 
 #ifndef VERIFIER_IP
-#define VERIFIER_IP "192.168.68.107"
+#define VERIFIER_IP "192.168.68.102"
 #endif
 #ifndef VERIFIER_PORT
 #define VERIFIER_PORT 4242
 #endif
 
 // ------- Partial attestation config -------
-#define FW_BLOCKS_N    64
+#define FW_BLOCKS_N    256
 #define MAX_REQ_BLOCKS 32
 
 // linker symbols provided by Pico toolchain
@@ -64,6 +77,13 @@ static void comm_tcp_close(void);
 static err_t tcp_recv_cb(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err);
 static void  tcp_err_cb(void *arg, err_t err);
 static err_t tcp_connected_cb(void *arg, struct tcp_pcb *tpcb, err_t err);
+
+
+static uint32_t inject_offset_from_fw_start(void) {
+    const uint8_t *base = &__flash_binary_start;
+    const uint8_t *p    = (const uint8_t*)injected_blob;
+    return (uint32_t)(p - base);
+}
 
 // ===================== DWT enable =====================
 static inline void dwt_enable_all(void) {
@@ -170,124 +190,121 @@ static int parse_indices_list(const char *line, uint32_t *out, int out_max) {
     return n;
 }
 
-// ===================== FFT workload pipeline =====================
-#define FFT_N 256
-#define FS_HZ 250.0
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+// ===================== Your signal pipeline =====================
+#define LEN 512
+static double sig_in[LEN];
+static double sig_filt[LEN];
 
+#define LPF_ORDER 8
+static const double lp_coefficients[LPF_ORDER] = {
+    -0.00511, 0.01017, 0.05730, 0.20164,
+     0.47291, 0.20164, 0.05730, 0.01017
+};
 
-typedef struct { double r, i; } cpx_t;
+static void generate_light_signal(double fs) {
+    for (size_t i = 0; i < LEN; i++) {
+        double t = i / fs;
+        double f_ecg = 1.0 + ((rand()%40)/100.0);
+        double ecg = 0.7 * sin(2*M_PI*f_ecg * t);
+        double tremor_amp = 0.05 + ((rand()%50)/1000.0);
+        double tremor = tremor_amp * sin(2*M_PI*4.0 * t);
+        double noise  = ((rand()%2000)/1000.0 - 1.0) * 0.02;
+        sig_in[i] = ecg + tremor + noise;
 
-static cpx_t fft_buf[FFT_N];
-static double mag[FFT_N / 2];
-static volatile double fft_sink = 0.0;
+        if ((i & 63u) == 0u) net_service();
+    }
+}
 
-static inline cpx_t c_add(cpx_t a, cpx_t b) { return (cpx_t){a.r + b.r, a.i + b.i}; }
-static inline cpx_t c_sub(cpx_t a, cpx_t b) { return (cpx_t){a.r - b.r, a.i - b.i}; }
-static inline cpx_t c_mul(cpx_t a, cpx_t b) { return (cpx_t){a.r*b.r - a.i*b.i, a.r*b.i + a.i*b.r}; }
+static void generate_medium_signal(double fs) {
+    double f_ecg = 1.0 + ((rand() % 40) / 100.0);
+    double f_tremor = 5.5 + ((rand() % 100) / 100.0);
+    double tremor_amp = 0.25 + ((rand() % 100) / 1000.0);
+    double noise_amp = 0.03 + ((rand() % 20) / 1000.0);
 
-static void fft(cpx_t *buf, int n) {
-    int i, j, k, m;
+    for (size_t i = 0; i < LEN; i++) {
+        double t = i / fs;
+        double ecg    = 0.7 * sin(2 * M_PI * f_ecg * t);
+        double tremor = tremor_amp * sin(2 * M_PI * f_tremor * t);
+        double noise  = ((rand() % 2000) / 1000.0 - 1.0) * noise_amp;
+        sig_in[i] = ecg + tremor + noise;
 
-    // bit-reversal
-    for (i = 1, j = 0; i < n; i++) {
-        int bit = n >> 1;
-        while (j & bit) { j ^= bit; bit >>= 1; }
-        j |= bit;
-        if (i < j) { cpx_t tmp = buf[i]; buf[i] = buf[j]; buf[j] = tmp; }
-        if ((i & 31) == 0) net_service();
+        if ((i & 63u) == 0u) net_service();
+    }
+}
+
+static void generate_heavy_signal(double fs) {
+    double f_ecg = 1.0 + ((rand() % 40) / 100.0);
+    double f_tremor = 7.5 + ((rand() % 150) / 100.0);
+    double tremor_amp = 0.5 + ((rand() % 200) / 1000.0);
+    double noise_amp = 0.06 + ((rand() % 30) / 1000.0);
+
+    for (size_t i = 0; i < LEN; i++) {
+        double t = i / fs;
+        double ecg    = 0.7 * sin(2 * M_PI * f_ecg * t);
+        double tremor = tremor_amp * sin(2 * M_PI * f_tremor * t);
+        double noise  = ((rand() % 2000) / 1000.0 - 1.0) * noise_amp;
+        sig_in[i] = ecg + tremor + noise;
+
+        if ((i & 63u) == 0u) net_service();
+    }
+}
+
+static void low_pass_fir(const double *in, double *out, size_t len,
+                         const double *h, int M) {
+    for (size_t n = 0; n < len; ++n) {
+        double sum = 0.0;
+        int kmax = (n < (size_t)(M - 1)) ? (int)n : (M - 1);
+        for (int k = 0; k <= kmax; ++k) {
+            sum += h[k] * in[n - (size_t)k];
+        }
+        out[n] = sum;
+
+        if ((n & 31u) == 0u) net_service();
+    }
+}
+
+static double compute_hr(const double *x, size_t len, double fs, double thr) {
+    if (!x || len < 3 || fs <= 0.0) return 0.0;
+
+    int peaks = 0;
+    for (size_t i = 1; i + 1 < len; i++) {
+        if (x[i] > x[i - 1] && x[i] > x[i + 1] && x[i] > thr) {
+            peaks++;
+            size_t skip = (size_t)(fs * 0.4);
+            i += skip;
+            if (i + 1 >= len) break;
+        }
     }
 
-    // Danielson–Lanczos
-    for (m = 1; m < n; m <<= 1) {
-        double ang = -M_PI / m;
-        cpx_t wm = {cos(ang), sin(ang)};
-        for (k = 0; k < n; k += (m << 1)) {
-            cpx_t w = {1.0, 0.0};
-            for (j = 0; j < m; j++) {
-                cpx_t t = c_mul(w, buf[k + j + m]);
-                cpx_t u = buf[k + j];
-                buf[k + j]     = c_add(u, t);
-                buf[k + j + m] = c_sub(u, t);
-                w = c_mul(w, wm);
-            }
+    double dur = (double)len / fs;
+    return dur > 0 ? (peaks / dur) * 60.0 : 0.0;
+}
+
+static volatile double hr_sink = 0.0;
+
+static inline void run_workload_step(int label) {
+    const double fs = 250.0;
+
+    if (label == 0) generate_light_signal(fs);
+    else if (label == 1) generate_medium_signal(fs);
+    else generate_heavy_signal(fs);
+
+    low_pass_fir(sig_in, sig_filt, LEN, lp_coefficients, LPF_ORDER);
+    net_service();
+
+    if (label == 1) {
+        low_pass_fir(sig_filt, sig_filt, LEN, lp_coefficients, LPF_ORDER);
+        net_service();
+    } else if (label == 2) {
+        for (int k = 0; k < 3; ++k) {
+            low_pass_fir(sig_filt, sig_filt, LEN, lp_coefficients, LPF_ORDER);
             net_service();
         }
     }
-}
 
-static void compute_mag(void) {
-    for (int k = 0; k < FFT_N/2; k++) {
-        mag[k] = sqrt(fft_buf[k].r * fft_buf[k].r + fft_buf[k].i * fft_buf[k].i);
-        if ((k & 31) == 0) net_service();
-    }
-}
+    hr_sink += compute_hr(sig_filt, LEN, fs, 0.2);
 
-static double band_energy(double f0, double f1) {
-    int k0 = (int)(f0 * FFT_N / FS_HZ);
-    int k1 = (int)(f1 * FFT_N / FS_HZ);
-    if (k0 < 0) k0 = 0;
-    if (k1 > (FFT_N/2 - 1)) k1 = (FFT_N/2 - 1);
-
-    double e = 0.0;
-    for (int k = k0; k <= k1; k++) {
-        e += mag[k] * mag[k];
-        if ((k & 31) == 0) net_service();
-    }
-    return e;
-}
-
-static void generate_fft_signal(double trem_freq, double trem_amp) {
-    double f_ecg = 1.0 + ((rand() % 40) / 100.0);
-
-    for (int i = 0; i < FFT_N; i++) {
-        double t = i / FS_HZ;
-        double ecg   = 0.7 * sin(2 * M_PI * f_ecg * t);
-        double trem  = trem_amp * sin(2 * M_PI * trem_freq * t);
-        double noise = ((rand() % 2000) / 1000.0 - 1.0) * 0.03;
-
-        fft_buf[i].r = ecg + trem + noise;
-        fft_buf[i].i = 0.0;
-
-        if ((i & 31) == 0) net_service();
-    }
-}
-
-// ===================== Workload Router (FFT) =====================
-static inline void run_workload_step(int label) {
-    if (label == 0) { // LIGHT
-        generate_fft_signal(4.0, 0.05);
-        fft(fft_buf, FFT_N);
-        compute_mag();
-        fft_sink += band_energy(3.0, 10.0) / (band_energy(0.5, 3.0) + 1e-6);
-        sleep_ms(2); // κρατάει λίγο "ανάσα" όπως πριν
-    }
-    else if (label == 1) { // MEDIUM
-        generate_fft_signal(6.0, 0.25);
-        fft(fft_buf, FFT_N);
-        fft(fft_buf, FFT_N);  // extra work
-        compute_mag();
-        fft_sink += (band_energy(3.0, 10.0) + band_energy(10.0, 40.0)) / (band_energy(0.5, 3.0) + 1e-6);
-    }
-    else { // HEAVY
-        generate_fft_signal(8.5, 0.50);
-        for (int i = 0; i < 4; i++) fft(fft_buf, FFT_N); // more work
-        compute_mag();
-
-        double e1 = band_energy(0.5, 3.0);
-        double e2 = band_energy(3.0, 10.0);
-        double e3 = band_energy(10.0, 40.0);
-
-        volatile double acc = 0.0;
-        for (int i = 0; i < 500; i++) {
-            acc += e3 / (e2 + 1e-6);
-            acc *= 0.995;
-            if ((i & 63) == 0) net_service();
-        }
-        fft_sink += acc;
-    }
+    if (label == 0) sleep_ms(2);
 }
 
 // ===================== Aggregator (2ms oversampling) =====================
@@ -636,6 +653,7 @@ static void handle_line(char *line) {
 
         bool is_full    = (strstr(line, "\"mode\":\"FULL_HASH_PROVER\"") != NULL);
         bool is_partial = (strstr(line, "\"mode\":\"PARTIAL_BLOCKS\"") != NULL);
+        
 
         if (!is_full && !is_partial) {
             char out[220];
@@ -813,6 +831,12 @@ static void tcp_err_cb(void *arg, err_t err) {
     g_connected = false;
     g_pcb = NULL;
 }
+static uint32_t fw_len_bytes(void) {
+    const uint8_t *start = &__flash_binary_start;
+    const uint8_t *end   = &__flash_binary_end;
+    return (uint32_t)(end - start);
+}
+
 
 static err_t tcp_connected_cb(void *arg, struct tcp_pcb *tpcb, err_t err) {
     (void)arg;
@@ -821,15 +845,26 @@ static err_t tcp_connected_cb(void *arg, struct tcp_pcb *tpcb, err_t err) {
     g_connected = true;
     g_pcb = tpcb;
 
-    char hello[128];
-    snprintf(hello, sizeof(hello),
-         "{\"type\":\"HELLO\",\"device_id\":\"pico2w_%u\","
-         "\"fw_blocks_n\":%u,"
-         "\"max_req_blocks\":%u}\n",
-         DEVICE_ID,
-         (unsigned)FW_BLOCKS_N,
-         (unsigned)MAX_REQ_BLOCKS);
-    comm_send_str(hello);
+char hello[256];
+snprintf(hello, sizeof(hello),
+    "{\"type\":\"HELLO\",\"device_id\":\"pico2w_%u\","
+    "\"fw_blocks_n\":%u,"
+    "\"max_req_blocks\":%u,"
+    "\"inject_bytes\":%u,"
+    "\"inject_off\":%u,"
+    "\"inject_max\":%u,"
+    "\"fw_len\":%u}\n",
+    DEVICE_ID,
+    (unsigned)FW_BLOCKS_N,
+    (unsigned)MAX_REQ_BLOCKS,
+    (unsigned)INJECT_BYTES,
+    (unsigned)inject_offset_from_fw_start(),
+    (unsigned)MAX_INJECT,
+    (unsigned)fw_len_bytes()
+);
+
+comm_send_str(hello);
+
 
     return ERR_OK;
 }
@@ -952,27 +987,11 @@ int main(void) {
     add_repeating_timer_ms(-2,   timer_2ms_cb,   NULL, &t2ms);
     add_repeating_timer_ms(-100, timer_100ms_cb, NULL, &t100ms);
 
-    const uint32_t windows_per_class = 300;
-
-    for (int phase = 0; phase < 3; phase++) {
-        current_label = (uint32_t)phase;
-        uint32_t end_window = window_id + windows_per_class;
-
-        while (1) {
-            net_service();                 // keep stack alive (poll+parse+reconnect)
-            run_workload_step((int)current_label);
-
-            uint32_t wid_now;
-            uint32_t flags = save_and_disable_interrupts();
-            wid_now = window_id;
-            restore_interrupts(flags);
-
-            if (wid_now >= end_window) break;
-        }
-    }
+    // Force ONLY LIGHT workload forever
+    current_label = 0;
 
     while (1) {
-        net_service();
-        sleep_ms(1000);
+        net_service();               // keep stack alive (poll+parse+reconnect)
+        run_workload_step(0);        // light only
     }
 }

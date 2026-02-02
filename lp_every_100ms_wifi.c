@@ -820,7 +820,12 @@ static err_t tcp_connected_cb(void *arg, struct tcp_pcb *tpcb, err_t err) {
 
     char hello[128];
     snprintf(hello, sizeof(hello),
-             "{\"type\":\"HELLO\",\"device_id\":\"pico2w_%u\"}\n", DEVICE_ID);
+         "{\"type\":\"HELLO\",\"device_id\":\"pico2w_%u\","
+         "\"fw_blocks_n\":%u,"
+         "\"max_req_blocks\":%u}\n",
+         DEVICE_ID,
+         (unsigned)FW_BLOCKS_N,
+         (unsigned)MAX_REQ_BLOCKS);
     comm_send_str(hello);
 
     return ERR_OK;

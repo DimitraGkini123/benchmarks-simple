@@ -70,39 +70,6 @@ target_link_libraries(pico-benchmark
 pico_add_extra_outputs(pico-benchmark)
 
 # ---------------------------------------------------------
-# ΝΕΟ EXECUTABLE ΓΙΑ ΤΟ HEALTHCARE FFT BENCHMARK
-# ---------------------------------------------------------
-add_executable(fft_benchmark
-    fft_benchmark.c
-)
-
-target_link_libraries(fft_benchmark
-    pico_stdlib
-)
-
-# Add the standard include files to the build
-target_include_directories(fft_benchmark PRIVATE
-        ${CMAKE_CURRENT_LIST_DIR}
-)
-pico_enable_stdio_uart(fft_benchmark 0)
-pico_enable_stdio_usb(fft_benchmark 1)
-
-pico_add_extra_outputs(fft_benchmark)
-
-# ---------------------------------------------------------
-# ΝΕΟ EXECUTABLE ΓΙΑ ΤΟ MOVING AVERAGE BENCHMARK
-# ---------------------------------------------------------
-
-add_executable(ma_benchmark
-    ma_benchmark.c
-)
-
-target_link_libraries( ma_benchmark pico_stdlib)
-pico_enable_stdio_usb( ma_benchmark 1)
-pico_enable_stdio_uart( ma_benchmark 0)
-pico_add_extra_outputs( ma_benchmark)
-
-# ---------------------------------------------------------
 # ΝΕΟ EXECUTABLE ΓΙΑ ΤΟ LOW PASS FILTER BENCHMARK
 # ---------------------------------------------------------
 add_executable(lp_benchmark
@@ -115,17 +82,6 @@ pico_enable_stdio_uart(lp_benchmark 0)
 pico_add_extra_outputs(lp_benchmark)
 
 
-# ---------------------------------------------------------
-# ΝΕΟ EXECUTABLE ΓΙΑ ΤΟ SEIZURE BENCHMARK
-# ---------------------------------------------------------
-add_executable(seizure_benchmark
- seizure_benchmark.c
-)
-
-target_link_libraries(seizure_benchmark pico_stdlib)
-pico_enable_stdio_usb(seizure_benchmark 1)
-pico_enable_stdio_uart(seizure_benchmark 0)
-pico_add_extra_outputs(seizure_benchmark)
 
 add_executable(lp_benchmark_injection_static
  lp_benchmark_injection_static.c
@@ -146,23 +102,6 @@ pico_enable_stdio_usb(lp_dynamic_injection 1)
 pico_enable_stdio_uart(lp_dynamic_injection 0)
 pico_add_extra_outputs(lp_dynamic_injection)
 
-add_executable(lp_dos
- lp_dos.c
-)
-
-target_link_libraries(lp_dos pico_stdlib)
-pico_enable_stdio_usb(lp_dos 1)
-pico_enable_stdio_uart(lp_dos 0)
-pico_add_extra_outputs(lp_dos)
-
-add_executable(lp_rop
- lp_rop.c
-)
-
-target_link_libraries(lp_rop pico_stdlib)
-pico_enable_stdio_usb(lp_rop 1)
-pico_enable_stdio_uart(lp_rop 0)
-pico_add_extra_outputs(lp_rop)
 
 
 add_executable(lp_every_100ms
@@ -236,7 +175,7 @@ pico_enable_stdio_uart(lp_every_100ms_wifi 0)
 target_compile_definitions(lp_every_100ms_wifi PRIVATE
     WIFI_SSID=\"${WIFI_SSID}\"
     WIFI_PASSWORD=\"${WIFI_PASSWORD}\"
-    VERIFIER_IP=\"192.168.68.102\"
+    VERIFIER_IP=\"192.168.68.103\"
     VERIFIER_PORT=4242
 )
 
@@ -274,8 +213,6 @@ target_compile_definitions(lp_100ms_wifi_rop PRIVATE
 pico_add_extra_outputs(lp_100ms_wifi_rop)
 
 
-
-
 add_executable(lp_interr_storm
  lp_interr_storm.c
 )
@@ -295,6 +232,18 @@ pico_enable_stdio_usb(lp_inj 1)
 pico_enable_stdio_uart(lp_inj 0)
 pico_add_extra_outputs(lp_inj
 )
+
+
+add_executable(lp_inj_patched
+ lp_inj_patched.c
+)
+
+target_link_libraries(lp_inj_patched pico_stdlib)
+pico_enable_stdio_usb(lp_inj_patched 1)
+pico_enable_stdio_uart(lp_inj_patched 0)
+pico_add_extra_outputs(lp_inj_patched
+)
+
 
 
 #NEW FOR SECOND DEVICE 
@@ -320,8 +269,67 @@ pico_enable_stdio_uart(fft_100ms_wifi 0)
 target_compile_definitions(fft_100ms_wifi PRIVATE
     WIFI_SSID=\"${WIFI_SSID}\"
     WIFI_PASSWORD=\"${WIFI_PASSWORD}\"
-    VERIFIER_IP=\"192.168.68.102\"
+    VERIFIER_IP=\"192.168.68.107\"
     VERIFIER_PORT=4242
 )
 
 pico_add_extra_outputs(fft_100ms_wifi)
+
+add_executable(lp_wifi_base
+    lp_wifi_inj_exp.c
+    sha256.c
+)
+
+target_link_libraries(lp_wifi_base
+    pico_stdlib
+    pico_cyw43_arch_lwip_threadsafe_background
+    hardware_timer
+    hardware_sync
+)
+
+target_include_directories(lp_wifi_base PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}
+)
+
+pico_enable_stdio_usb(lp_wifi_base 1)
+pico_enable_stdio_uart(lp_wifi_base 0)
+
+target_compile_definitions(lp_wifi_base PRIVATE
+    WIFI_SSID=\"${WIFI_SSID}\"
+    WIFI_PASSWORD=\"${WIFI_PASSWORD}\"
+    VERIFIER_IP=\"192.168.68.103\"
+    VERIFIER_PORT=4242
+    INJECT_BYTES=0
+)
+
+pico_add_extra_outputs(lp_wifi_base)
+
+add_executable(lp_patch_exp2
+    lp_patch_exp2.c
+    sha256.c
+)
+
+target_link_libraries(lp_patch_exp2
+    pico_stdlib
+    pico_cyw43_arch_lwip_threadsafe_background
+    hardware_timer
+    hardware_sync
+)
+
+target_include_directories(lp_patch_exp2 PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}
+)
+
+pico_enable_stdio_usb(lp_patch_exp2 1)
+pico_enable_stdio_uart(lp_patch_exp2 0)
+
+target_compile_definitions(lp_patch_exp2 PRIVATE
+    WIFI_SSID=\"${WIFI_SSID}\"
+    WIFI_PASSWORD=\"${WIFI_PASSWORD}\"
+    VERIFIER_IP=\"192.168.68.103\"
+    VERIFIER_PORT=4242
+    INJECT_BYTES=0
+)
+
+pico_add_extra_outputs(lp_patch_exp2)
+
