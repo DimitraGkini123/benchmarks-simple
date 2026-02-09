@@ -63,10 +63,10 @@ def patch_uf2(in_uf2: Path, out_uf2: Path, target_addr: int, cfg_bytes: bytes):
 
 if __name__ == "__main__":
     # Inputs (adjust filenames if needed)
-    in_uf2 = Path("build/lp_inj_patched.uf2")
+    in_uf2 = Path("build/lp_inj_patched_wifi.uf2")
     out_uf2 = Path("build/lp_inj_cfgON.uf2")
     cfg = read_cfg(Path("attested_cfg.bin"))
 
-    target_addr = 0x10007A00  # from your print
+    target_addr = 0x10051F00
 
     patch_uf2(in_uf2, out_uf2, target_addr, cfg)

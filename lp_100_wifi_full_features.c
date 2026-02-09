@@ -1,8 +1,3 @@
-// Code injection after 15s with wifi
-// experiment with different memory partitions
-
-//αλλαζω blocks ωστε να χαλάει το hash χωρις να εχει αντίκτυπο στους counters 
-
 #include <string.h>
 #include "pico/cyw43_arch.h"
 #include "lwip/tcp.h"
@@ -16,32 +11,9 @@
 #include <stddef.h>
 #include "sha256.h"
 #include "pico/stdlib.h"
-#include "hardware/flash.h"
-#include "pico/time.h"
 #include "hardware/timer.h"
 
-#ifndef INJECT_PAYLOAD_HEADER
-#define INJECT_PAYLOAD_HEADER "inject_payload_zero.h"
-#endif
-#include INJECT_PAYLOAD_HEADER
-
-#include "hardware/regs/addressmap.h"  // for XIP_BASE
-
-// ===================== STATIC INJECTION KNOB =====================
-
-#define MAX_INJECT 8192
-
-__attribute__((used, aligned(256), section(".rodata.inject")))
-static const uint8_t injected_blob[MAX_INJECT] = {
-    [0 ... (MAX_INJECT - 1)] = 0xFF
-};
-
-#ifndef INJECT_BYTES
-#define INJECT_BYTES MAX_INJECT
-#endif
-
 // ===================== DWT registers =====================
-
 #define DEMCR                (*(volatile uint32_t *)0xE000EDFC)
 #define DEMCR_TRCENA         (1u << 24)
 
@@ -67,111 +39,33 @@ static const uint8_t injected_blob[MAX_INJECT] = {
 #ifndef VERIFIER_IP
 #define VERIFIER_IP "192.168.68.102"
 #endif
-
 #ifndef VERIFIER_PORT
 #define VERIFIER_PORT 4242
 #endif
 
 // ------- Partial attestation config -------
-
-#define FW_BLOCKS_N      128
-#define MAX_REQ_BLOCKS   32
+#define FW_BLOCKS_N    20
+#define MAX_REQ_BLOCKS 32
 
 // linker symbols provided by Pico toolchain
 extern const uint8_t __flash_binary_start;
 extern const uint8_t __flash_binary_end;
 
 // ===================== Forward declarations =====================
-
 static void comm_poll_parse(void);
 static inline void net_service(void);
 static void comm_ensure_connected(void);
+
 static bool comm_wifi_init_once(void);
 static bool comm_tcp_connect(void);
 static void comm_tcp_close(void);
 
-static int g_delay_ms = 15000;      // 15s
-static int g_corrupt_blocks = 3;    // placeholder
-
 // lwIP callbacks
 static err_t tcp_recv_cb(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err);
-static void tcp_err_cb(void *arg, err_t err);
+static void  tcp_err_cb(void *arg, err_t err);
 static err_t tcp_connected_cb(void *arg, struct tcp_pcb *tpcb, err_t err);
 
-// ===================== Injection helpers =====================
-
-static uint32_t inject_offset_from_fw_start(void) {
-    const uint8_t *base = &__flash_binary_start;
-    const uint8_t *p = (const uint8_t*)injected_blob;
-    return (uint32_t)(p - base);
-}
-
-static void flash_patch_one_byte(const uint8_t *xip_addr, uint8_t new_val) {
-    // page-align (256B)
-    uintptr_t a = (uintptr_t)xip_addr;
-    uintptr_t page_base = a & ~(uintptr_t)(FLASH_PAGE_SIZE - 1);
-
-    // copy current page (from XIP) to RAM buffer
-    uint8_t buf[FLASH_PAGE_SIZE];
-    memcpy(buf, (const void*)page_base, FLASH_PAGE_SIZE);
-
-    // offset inside page
-    size_t off = (size_t)(a - page_base);
-
-    // IMPORTANT: only 1->0 allowed
-    buf[off] = (uint8_t)(buf[off] & new_val);
-
-    uint32_t flash_off = (uint32_t)(page_base - (uintptr_t)XIP_BASE);
-
-    uint32_t irq = save_and_disable_interrupts();
-    flash_range_program(flash_off, buf, FLASH_PAGE_SIZE);
-    restore_interrupts(irq);
-}
-
-static void compromise_after_delay(void) {
-    const uint8_t *fw_start = &__flash_binary_start;
-    const uint8_t *fw_end = &__flash_binary_end;
-
-    size_t fw_len = (size_t)(fw_end - fw_start);
-    if (fw_len == 0) return;
-
-    size_t block_size = (fw_len + (FW_BLOCKS_N - 1)) / FW_BLOCKS_N;
-    if (block_size == 0) return;
-
-    // offset (inside firmware) where injected_blob starts
-    size_t inj_off = (size_t)inject_offset_from_fw_start();
-
-    int n = g_corrupt_blocks;
-    if (n < 1) n = 1;
-    if (n > 32) n = 32; // arbitrary cap
-
-    for (int i = 0; i < n; i++) {
-        size_t off = inj_off + (size_t)i * block_size;
-
-        // keep offset within firmware AND within injected_blob region
-        if (off >= fw_len) break;
-        if (off >= inj_off + MAX_INJECT) break;
-
-        const uint8_t *target = fw_start + off;
-
-        // write one byte (0x00) => guaranteed mismatch, only 1->0
-        flash_patch_one_byte(target, 0x00);
-    }
-}
-
-static int64_t compromise_alarm_cb(alarm_id_t id, void *user_data) {
-    (void)id;
-    (void)user_data;
-    compromise_after_delay();
-    return 0; // one-shot
-}
-
-static void schedule_compromise(void) {
-    add_alarm_in_ms(g_delay_ms, compromise_alarm_cb, NULL, false);
-}
-
-// ===================== DWT enable =====================
-
+// ===================== DWT enable/reset =====================
 static inline void dwt_enable_all(void) {
     DEMCR |= DEMCR_TRCENA;
     DWT_LAR = 0xC5ACCE55;
@@ -191,6 +85,15 @@ static inline void dwt_enable_all(void) {
                 DWT_CTRL_FOLDEVTENA;
 }
 
+static inline void dwt_reset_event_counters_only(void) {
+    DWT_CYCCNT   = 0;
+    DWT_CPICNT   = 0;
+    DWT_EXCCNT   = 0;
+    DWT_SLEEPCNT = 0;
+    DWT_LSUCNT   = 0;
+    DWT_FOLDCNT  = 0;
+}
+
 // code injection for dummies
 __attribute__((used))
 static void fw_dummy_never_called(void) {
@@ -199,12 +102,11 @@ static void fw_dummy_never_called(void) {
 }
 
 // ===================== SHA helpers =====================
-
 static void to_hex(const uint8_t *in, size_t n, char *out_hex /* size 2n+1 */) {
     static const char *H = "0123456789abcdef";
     for (size_t i = 0; i < n; i++) {
-        out_hex[2*i + 0] = H[(in[i] >> 4) & 0xF];
-        out_hex[2*i + 1] = H[in[i] & 0xF];
+        out_hex[2*i+0] = H[(in[i] >> 4) & 0xF];
+        out_hex[2*i+1] = H[in[i] & 0xF];
     }
     out_hex[2*n] = 0;
 }
@@ -220,12 +122,9 @@ static void compute_fw_hash(uint8_t out_hash[32]) {
     sha256_final(&ctx, out_hash);
 }
 
-static void compute_nonce_bound_response(
-    const uint8_t *nonce,
-    size_t nonce_len,
-    const uint8_t fw_hash[32],
-    uint8_t out_resp[32]
-) {
+static void compute_nonce_bound_response(const uint8_t *nonce, size_t nonce_len,
+                                         const uint8_t fw_hash[32],
+                                         uint8_t out_resp[32]) {
     sha256_ctx ctx;
     sha256_init(&ctx);
     sha256_update(&ctx, nonce, nonce_len);
@@ -233,7 +132,8 @@ static void compute_nonce_bound_response(
     sha256_final(&ctx, out_resp);
 }
 
-static bool compute_fw_block_hash(uint32_t block_idx, uint8_t out_hash[32], uint32_t *out_off, uint32_t *out_len) {
+static bool compute_fw_block_hash(uint32_t block_idx, uint8_t out_hash[32],
+                                  uint32_t *out_off, uint32_t *out_len) {
     const uint8_t *start = &__flash_binary_start;
     const uint8_t *end   = &__flash_binary_end;
 
@@ -242,6 +142,7 @@ static bool compute_fw_block_hash(uint32_t block_idx, uint8_t out_hash[32], uint
     if (block_idx >= FW_BLOCKS_N) return false;
 
     size_t block_size = (fw_len + (FW_BLOCKS_N - 1)) / FW_BLOCKS_N;
+
     size_t off = (size_t)block_idx * block_size;
     if (off >= fw_len) return false;
 
@@ -255,17 +156,15 @@ static bool compute_fw_block_hash(uint32_t block_idx, uint8_t out_hash[32], uint
 
     if (out_off) *out_off = (uint32_t)off;
     if (out_len) *out_len = (uint32_t)len;
-
     return true;
 }
 
 static int parse_indices_list(const char *line, uint32_t *out, int out_max) {
     const char *p = strstr(line, "\"indices\":[");
     if (!p) return 0;
-
     p += strlen("\"indices\":[");
-    int n = 0;
 
+    int n = 0;
     while (*p && *p != ']' && n < out_max) {
         while (*p == ' ' || *p == '\t' || *p == ',') p++;
         if (*p == ']') break;
@@ -273,7 +172,6 @@ static int parse_indices_list(const char *line, uint32_t *out, int out_max) {
         char *endptr = NULL;
         long v = strtol(p, &endptr, 10);
         if (endptr == p) break;
-
         if (v < 0) v = 0;
         out[n++] = (uint32_t)v;
         p = endptr;
@@ -281,10 +179,8 @@ static int parse_indices_list(const char *line, uint32_t *out, int out_max) {
     return n;
 }
 
-// ===================== Your signal pipeline =====================
-
+// ===================== Your signal pipeline (NO net_service inside loops) =====================
 #define LEN 512
-
 static double sig_in[LEN];
 static double sig_filt[LEN];
 
@@ -297,18 +193,12 @@ static const double lp_coefficients[LPF_ORDER] = {
 static void generate_light_signal(double fs) {
     for (size_t i = 0; i < LEN; i++) {
         double t = i / fs;
-
-        double f_ecg = 1.0 + ((rand() % 40) / 100.0);
-        double ecg = 0.7 * sin(2 * M_PI * f_ecg * t);
-
-        double tremor_amp = 0.05 + ((rand() % 50) / 1000.0);
-        double tremor = tremor_amp * sin(2 * M_PI * 4.0 * t);
-
-        double noise = ((rand() % 2000) / 1000.0 - 1.0) * 0.02;
-
+        double f_ecg = 1.0 + ((rand()%40)/100.0);
+        double ecg = 0.7 * sin(2*M_PI*f_ecg * t);
+        double tremor_amp = 0.05 + ((rand()%50)/1000.0);
+        double tremor = tremor_amp * sin(2*M_PI*4.0 * t);
+        double noise  = ((rand()%2000)/1000.0 - 1.0) * 0.02;
         sig_in[i] = ecg + tremor + noise;
-
-        if ((i & 63u) == 0u) net_service();
     }
 }
 
@@ -320,14 +210,10 @@ static void generate_medium_signal(double fs) {
 
     for (size_t i = 0; i < LEN; i++) {
         double t = i / fs;
-
-        double ecg = 0.7 * sin(2 * M_PI * f_ecg * t);
+        double ecg    = 0.7 * sin(2 * M_PI * f_ecg * t);
         double tremor = tremor_amp * sin(2 * M_PI * f_tremor * t);
-        double noise = ((rand() % 2000) / 1000.0 - 1.0) * noise_amp;
-
+        double noise  = ((rand() % 2000) / 1000.0 - 1.0) * noise_amp;
         sig_in[i] = ecg + tremor + noise;
-
-        if ((i & 63u) == 0u) net_service();
     }
 }
 
@@ -339,29 +225,22 @@ static void generate_heavy_signal(double fs) {
 
     for (size_t i = 0; i < LEN; i++) {
         double t = i / fs;
-
-        double ecg = 0.7 * sin(2 * M_PI * f_ecg * t);
+        double ecg    = 0.7 * sin(2 * M_PI * f_ecg * t);
         double tremor = tremor_amp * sin(2 * M_PI * f_tremor * t);
-        double noise = ((rand() % 2000) / 1000.0 - 1.0) * noise_amp;
-
+        double noise  = ((rand() % 2000) / 1000.0 - 1.0) * noise_amp;
         sig_in[i] = ecg + tremor + noise;
-
-        if ((i & 63u) == 0u) net_service();
     }
 }
 
-static void low_pass_fir(const double *in, double *out, size_t len, const double *h, int M) {
+static void low_pass_fir(const double *in, double *out, size_t len,
+                         const double *h, int M) {
     for (size_t n = 0; n < len; ++n) {
         double sum = 0.0;
         int kmax = (n < (size_t)(M - 1)) ? (int)n : (M - 1);
-
         for (int k = 0; k <= kmax; ++k) {
             sum += h[k] * in[n - (size_t)k];
         }
-
         out[n] = sum;
-
-        if ((n & 31u) == 0u) net_service();
     }
 }
 
@@ -384,33 +263,7 @@ static double compute_hr(const double *x, size_t len, double fs, double thr) {
 
 static volatile double hr_sink = 0.0;
 
-static inline void run_workload_step(int label) {
-    const double fs = 250.0;
-
-    if (label == 0) generate_light_signal(fs);
-    else if (label == 1) generate_medium_signal(fs);
-    else generate_heavy_signal(fs);
-
-    low_pass_fir(sig_in, sig_filt, LEN, lp_coefficients, LPF_ORDER);
-    net_service();
-
-    if (label == 1) {
-        low_pass_fir(sig_filt, sig_filt, LEN, lp_coefficients, LPF_ORDER);
-        net_service();
-    } else if (label == 2) {
-        for (int k = 0; k < 3; ++k) {
-            low_pass_fir(sig_filt, sig_filt, LEN, lp_coefficients, LPF_ORDER);
-            net_service();
-        }
-    }
-
-    hr_sink += compute_hr(sig_filt, LEN, fs, 0.2);
-
-    if (label == 0) sleep_ms(2);
-}
-
 // ===================== Aggregator (2ms oversampling) =====================
-
 typedef struct {
     uint32_t sum_cyc;
     uint32_t sum_lsu;
@@ -426,6 +279,7 @@ static volatile agg_t agg = (agg_t){0};
 // previous readings for delta
 static uint32_t prev_cyc = 0;
 static uint64_t prev_t_us = 0;
+
 static uint8_t prev_lsu8 = 0, prev_cpi8 = 0, prev_exc8 = 0, prev_fold8 = 0, prev_sleep8 = 0;
 
 static inline uint8_t delta_u8(uint8_t curr, uint8_t prev) {
@@ -433,7 +287,6 @@ static inline uint8_t delta_u8(uint8_t curr, uint8_t prev) {
 }
 
 // ===================== Ring buffer for 100ms samples =====================
-
 typedef struct {
     uint32_t device_id;
     uint32_t window_id;
@@ -447,30 +300,62 @@ typedef struct {
 } sample_t;
 
 #define RING_N 256
-
 static volatile sample_t ring[RING_N];
 static volatile uint32_t w_idx = 0;
 static volatile uint32_t r_idx = 0;
 static volatile uint32_t ring_dropped = 0;
 
-static inline bool ring_push(const sample_t *s) {
+static inline bool ring_push_isr_safe(const sample_t *s) {
+    uint32_t flags = save_and_disable_interrupts();
     uint32_t next = (w_idx + 1u) % RING_N;
     if (next == r_idx) {
         ring_dropped++;
+        restore_interrupts(flags);
         return false;
     }
     ring[w_idx] = *s;
     w_idx = next;
+    restore_interrupts(flags);
     return true;
 }
 
 // ===================== Global label/window =====================
-
 static volatile uint32_t current_label = 0;
 static volatile uint32_t window_id = 0;
 
-// ===================== 2ms callback =====================
+// ===================== Measurement gating: make WiFi cost "invisible" =====================
+static inline void measurement_pause_for_net(void) {
+    // Stop aggregating anything from timers while we do net ops
+    uint32_t flags = save_and_disable_interrupts();
+    agg = (agg_t){0};
+    restore_interrupts(flags);
 
+    // Reset counters and prevs so next deltas start fresh after net
+    dwt_reset_event_counters_only();
+
+    prev_t_us = time_us_64();
+    prev_cyc  = DWT_CYCCNT;
+
+    prev_lsu8   = (uint8_t)DWT_LSUCNT;
+    prev_cpi8   = (uint8_t)DWT_CPICNT;
+    prev_exc8   = (uint8_t)DWT_EXCCNT;
+    prev_fold8  = (uint8_t)DWT_FOLDCNT;
+    prev_sleep8 = (uint8_t)DWT_SLEEPCNT;
+}
+
+// rate-limit network servicing (keeps stack alive but deterministic-ish)
+static absolute_time_t next_net_at;
+static inline void net_service_gated_rl(void) {
+    if (!time_reached(next_net_at)) return;
+    next_net_at = make_timeout_time_ms(10); // every 10ms (tune: 5..20ms)
+
+    // Ensure WiFi/TCP activity does not leak into counters
+    measurement_pause_for_net();
+    net_service();
+    measurement_pause_for_net();
+}
+
+// ===================== 2ms callback =====================
 bool timer_2ms_cb(struct repeating_timer *t) {
     (void)t;
 
@@ -482,50 +367,49 @@ bool timer_2ms_cb(struct repeating_timer *t) {
     uint32_t dC = (uint32_t)(cyc - prev_cyc);
     prev_cyc = cyc;
 
-    uint8_t lsu8 = (uint8_t)DWT_LSUCNT;
-    uint8_t cpi8 = (uint8_t)DWT_CPICNT;
-    uint8_t exc8 = (uint8_t)DWT_EXCCNT;
-    uint8_t fold8 = (uint8_t)DWT_FOLDCNT;
+    uint8_t lsu8   = (uint8_t)DWT_LSUCNT;
+    uint8_t cpi8   = (uint8_t)DWT_CPICNT;
+    uint8_t exc8   = (uint8_t)DWT_EXCCNT;
+    uint8_t fold8  = (uint8_t)DWT_FOLDCNT;
     uint8_t sleep8 = (uint8_t)DWT_SLEEPCNT;
 
-    uint8_t dL = delta_u8(lsu8, prev_lsu8);
-    uint8_t dP = delta_u8(cpi8, prev_cpi8);
-    uint8_t dE = delta_u8(exc8, prev_exc8);
-    uint8_t dF = delta_u8(fold8, prev_fold8);
+    uint8_t dL = delta_u8(lsu8,   prev_lsu8);
+    uint8_t dP = delta_u8(cpi8,   prev_cpi8);
+    uint8_t dE = delta_u8(exc8,   prev_exc8);
+    uint8_t dF = delta_u8(fold8,  prev_fold8);
     uint8_t dS = delta_u8(sleep8, prev_sleep8);
 
-    prev_lsu8 = lsu8;
-    prev_cpi8 = cpi8;
-    prev_exc8 = exc8;
-    prev_fold8 = fold8;
-    prev_sleep8 = sleep8;
+    prev_lsu8 = lsu8; prev_cpi8 = cpi8; prev_exc8 = exc8; prev_fold8 = fold8; prev_sleep8 = sleep8;
 
+    // aggregate
     agg.sum_dt_us += dt;
-    agg.sum_cyc += dC;
-    agg.sum_lsu += dL;
-    agg.sum_cpi += dP;
-    agg.sum_exc += dE;
-    agg.sum_fold += dF;
+    agg.sum_cyc   += dC;
+    agg.sum_lsu   += dL;
+    agg.sum_cpi   += dP;
+    agg.sum_exc   += dE;
+    agg.sum_fold  += dF;
     agg.sum_sleep += dS;
 
     return true;
 }
 
-// ===================== 100ms callback =====================
-
+// ===================== 100ms callback (RACE-FIXED) =====================
 bool timer_100ms_cb(struct repeating_timer *t) {
     (void)t;
 
-    agg_t a = agg;
+    agg_t a;
+    uint32_t flags = save_and_disable_interrupts();
+    a = agg;
     agg = (agg_t){0};
+    restore_interrupts(flags);
 
     float fdT = (a.sum_dt_us > 0) ? (float)a.sum_dt_us : 1.0f;
-    float fdC = (a.sum_cyc > 0) ? (float)a.sum_cyc : 1.0f;
+    float fdC = (a.sum_cyc   > 0) ? (float)a.sum_cyc   : 1.0f;
 
     sample_t s = (sample_t){0};
     s.device_id = DEVICE_ID;
     s.window_id = window_id++;
-    s.label = current_label;
+    s.label     = current_label;
 
     s.dT = a.sum_dt_us;
     s.dC = a.sum_cyc;
@@ -539,37 +423,36 @@ bool timer_100ms_cb(struct repeating_timer *t) {
     s.lsu_per_cyc  = ((float)a.sum_lsu) / fdC;
     s.cpi_per_cyc  = ((float)a.sum_cpi) / fdC;
     s.exc_per_cyc  = ((float)a.sum_exc) / fdC;
-    s.fold_per_cyc = ((float)a.sum_fold) / fdC;
+    s.fold_per_cyc = ((float)a.sum_fold)/ fdC;
 
-    (void)ring_push(&s);
+    (void)ring_push_isr_safe(&s);
     return true;
 }
 
 // ===================== TCP comms globals =====================
-
 static struct tcp_pcb *g_pcb = NULL;
 static bool g_connected = false;
 
 static char rxbuf[2048];
-static int rxlen = 0;
+static int  rxlen = 0;
 static volatile bool rx_dirty = false;
 
-static char txbuf_windows[9000];
+static char txbuf_windows[20000];
 static char txbuf_attest[13000];
 
 // ===================== WiFi/TCP state =====================
-
 static bool wifi_ready = false;
 static absolute_time_t next_reconnect_at;
 
 // ===================== send helper =====================
-
 static bool comm_send_all(const char *buf, size_t len) {
     if (!g_connected || !g_pcb) return false;
 
     size_t off = 0;
     while (off < len) {
+        // We gate net service elsewhere; here we only poll minimally.
         cyw43_arch_poll();
+
         cyw43_arch_lwip_begin();
 
         if (!g_pcb) {
@@ -591,6 +474,7 @@ static bool comm_send_all(const char *buf, size_t len) {
         if (e == ERR_OK) {
             err_t eo = tcp_output(g_pcb);
             cyw43_arch_lwip_end();
+
             if (eo == ERR_OK) {
                 off += chunk;
                 continue;
@@ -625,17 +509,13 @@ static void comm_send_str(const char *s) {
 }
 
 // ===================== tiny req_id extractor =====================
-
 static void extract_req_id(const char *line, char *out, int out_sz) {
     out[0] = 0;
-
     const char *p = strstr(line, "\"req_id\":\"");
     if (!p) return;
-
     p += strlen("\"req_id\":\"");
     const char *q = strchr(p, '"');
     if (!q) return;
-
     int n = (int)(q - p);
     if (n > 0 && n < out_sz) {
         memcpy(out, p, n);
@@ -644,7 +524,6 @@ static void extract_req_id(const char *line, char *out, int out_sz) {
 }
 
 // ===================== request handler =====================
-
 static void handle_line(char *line) {
     char req_id[64];
     extract_req_id(line, req_id, (int)sizeof(req_id));
@@ -668,16 +547,13 @@ static void handle_line(char *line) {
 
         char *pm = strstr(line, "\"max\":");
         if (pm) maxn = (int)strtol(pm + 6, NULL, 10);
-
         if (maxn < 1) maxn = 1;
         if (maxn > 50) maxn = 50;
 
-        // Snapshot ring indices (no pop) and build a response,
-        // then advance r_idx ONLY if send ok.
         sample_t snap[50];
         int snap_n = 0;
-        uint32_t r0, w0;
 
+        uint32_t r0, w0;
         uint32_t flags = save_and_disable_interrupts();
         r0 = r_idx;
         w0 = w_idx;
@@ -699,8 +575,7 @@ static void handle_line(char *line) {
         int out_sz = (int)sizeof(txbuf_windows);
         int pos = 0;
 
-        pos += snprintf(
-            out + pos, (size_t)(out_sz - pos),
+        pos += snprintf(out + pos, (size_t)(out_sz - pos),
             "{\"type\":\"WINDOWS\",\"req_id\":\"%s\",\"since\":%u,"
             "\"dropped_old\":%u,\"dropped_overflow\":%u,\"windows\":[",
             req_id2[0] ? req_id2 : "none",
@@ -719,53 +594,65 @@ static void handle_line(char *line) {
             if (sent == 0) first_id = s.window_id;
             last_id = s.window_id;
 
-            if (sent > 0) {
-                pos += snprintf(out + pos, (size_t)(out_sz - pos), ",");
-            }
+            if (sent > 0) pos += snprintf(out + pos, (size_t)(out_sz - pos), ",");
 
-            pos += snprintf(
-                out + pos, (size_t)(out_sz - pos),
-                "{\"window_id\":%u,\"label\":%u,\"dE\":%u,\"dS\":%u,\"dF\":%u,\"dL\":%u}",
-                s.window_id, s.label, s.dE, s.dS, s.dF, s.dL
-            );
+            pos += snprintf(out + pos, (size_t)(out_sz - pos),
+            "{"
+            "\"window_id\":%u,"
+            "\"label\":%u,"
+            "\"dC\":%u,"
+            "\"dL\":%u,"
+            "\"dP\":%u,"
+            "\"dE\":%u,"
+            "\"dF\":%u,"
+            "\"dS\":%u,"
+            "\"dT\":%u,"
+            "\"cyc_per_us\":%.6f"
+            "}",
+            (unsigned)s.window_id,
+            (unsigned)s.label,
+            (unsigned)s.dC,
+            (unsigned)s.dL,
+            (unsigned)s.dP,
+            (unsigned)s.dE,
+            (unsigned)s.dF,
+            (unsigned)s.dS,
+            (unsigned)s.dT,
+            (double)s.cyc_per_us
+        );
 
             sent++;
             if (pos > out_sz - 240) break;
         }
 
-        pos += snprintf(
-            out + pos, (size_t)(out_sz - pos),
+        pos += snprintf(out + pos, (size_t)(out_sz - pos),
             "],\"from\":%u,\"to\":%u,\"count\":%d}\n",
             sent ? first_id : 0,
             sent ? last_id : 0,
             sent
         );
 
+        // Gate this send too (so tcp_write doesn't leak)
+        measurement_pause_for_net();
         bool ok = comm_send_all(out, (size_t)pos);
+        measurement_pause_for_net();
+
         if (ok) {
             uint32_t f = save_and_disable_interrupts();
-
-            // advance read index for what we actually sent + old
             while (r_idx != w_idx) {
                 sample_t cur = ring[r_idx];
                 if (cur.window_id <= since) {
                     r_idx = (r_idx + 1u) % RING_N;
-                } else {
-                    break;
-                }
+                } else break;
             }
-
             if (sent > 0) {
                 while (r_idx != w_idx) {
                     sample_t cur = ring[r_idx];
                     if (cur.window_id <= last_id) {
                         r_idx = (r_idx + 1u) % RING_N;
-                    } else {
-                        break;
-                    }
+                    } else break;
                 }
             }
-
             restore_interrupts(f);
         }
 
@@ -776,7 +663,7 @@ static void handle_line(char *line) {
         char req_id2[64];
         extract_req_id(line, req_id2, (int)sizeof(req_id2));
 
-        bool is_full = (strstr(line, "\"mode\":\"FULL_HASH_PROVER\"") != NULL);
+        bool is_full    = (strstr(line, "\"mode\":\"FULL_HASH_PROVER\"") != NULL);
         bool is_partial = (strstr(line, "\"mode\":\"PARTIAL_BLOCKS\"") != NULL);
 
         if (!is_full && !is_partial) {
@@ -798,7 +685,6 @@ static void handle_line(char *line) {
             comm_send_str(out);
             return;
         }
-
         pn += strlen("\"nonce\":\"");
         const char *qn = strchr(pn, '"');
         if (!qn) {
@@ -809,18 +695,15 @@ static void handle_line(char *line) {
             comm_send_str(out);
             return;
         }
-
         int nhex = (int)(qn - pn);
         if (nhex <= 0 || nhex >= (int)sizeof(nonce_hex)) nhex = (int)sizeof(nonce_hex) - 1;
-
         memcpy(nonce_hex, pn, (size_t)nhex);
         nonce_hex[nhex] = 0;
 
         uint8_t nonce[64];
         size_t nonce_len = 0;
-
         for (int i = 0; i + 1 < nhex && nonce_len < sizeof(nonce); i += 2) {
-            char a = nonce_hex[i], b = nonce_hex[i + 1];
+            char a = nonce_hex[i], b = nonce_hex[i+1];
             uint8_t hi = (a <= '9') ? (a - '0') : ((a | 32) - 'a' + 10);
             uint8_t lo = (b <= '9') ? (b - '0') : ((b | 32) - 'a' + 10);
             nonce[nonce_len++] = (uint8_t)((hi << 4) | lo);
@@ -835,8 +718,7 @@ static void handle_line(char *line) {
             int out_sz = (int)sizeof(txbuf_attest);
             int pos = 0;
 
-            pos += snprintf(
-                out + pos, (size_t)(out_sz - pos),
+            pos += snprintf(out + pos, (size_t)(out_sz - pos),
                 "{\"type\":\"ATTEST_RESPONSE\",\"req_id\":\"%s\",\"mode\":\"PARTIAL_BLOCKS\",\"region\":\"fw\","
                 "\"block_count\":%u,\"blocks\":[",
                 req_id2[0] ? req_id2 : "none",
@@ -861,12 +743,9 @@ static void handle_line(char *line) {
                 to_hex(bh, 32, bh_hex);
                 to_hex(resp, 32, resp_hex);
 
-                if (sent > 0) {
-                    pos += snprintf(out + pos, (size_t)(out_sz - pos), ",");
-                }
+                if (sent > 0) pos += snprintf(out + pos, (size_t)(out_sz - pos), ",");
 
-                pos += snprintf(
-                    out + pos, (size_t)(out_sz - pos),
+                pos += snprintf(out + pos, (size_t)(out_sz - pos),
                     "{\"index\":%u,\"off\":%u,\"len\":%u,\"hash_hex\":\"%s\",\"response_hex\":\"%s\"}",
                     (unsigned)bi, (unsigned)off, (unsigned)blen, bh_hex, resp_hex
                 );
@@ -876,7 +755,10 @@ static void handle_line(char *line) {
             }
 
             pos += snprintf(out + pos, (size_t)(out_sz - pos), "],\"count\":%d}\n", sent);
+
+            measurement_pause_for_net();
             comm_send_str(out);
+            measurement_pause_for_net();
             return;
         }
 
@@ -891,10 +773,13 @@ static void handle_line(char *line) {
 
             char out[420];
             snprintf(out, sizeof(out),
-                     "{\"type\":\"ATTEST_RESPONSE\",\"req_id\":\"%s\",\"mode\":\"FULL_HASH_PROVER\",\"region\":\"fw\","
-                     "\"fw_hash_hex\":\"%s\",\"response_hex\":\"%s\"}\n",
-                     req_id2[0] ? req_id2 : "none", fw_hex, resp_hex);
+                "{\"type\":\"ATTEST_RESPONSE\",\"req_id\":\"%s\",\"mode\":\"FULL_HASH_PROVER\",\"region\":\"fw\","
+                "\"fw_hash_hex\":\"%s\",\"response_hex\":\"%s\"}\n",
+                req_id2[0] ? req_id2 : "none", fw_hex, resp_hex);
+
+            measurement_pause_for_net();
             comm_send_str(out);
+            measurement_pause_for_net();
             return;
         }
     }
@@ -909,7 +794,6 @@ static void handle_line(char *line) {
 }
 
 // ===================== parse buffered rx =====================
-
 static void comm_poll_parse(void) {
     if (!rx_dirty) return;
     rx_dirty = false;
@@ -918,7 +802,6 @@ static void comm_poll_parse(void) {
     while (1) {
         char *nl = strchr(start, '\n');
         if (!nl) break;
-
         *nl = 0;
         if (*start) handle_line(start);
         start = nl + 1;
@@ -930,7 +813,6 @@ static void comm_poll_parse(void) {
 }
 
 // ===================== net_service =====================
-
 static inline void net_service(void) {
     cyw43_arch_poll();
     comm_poll_parse();
@@ -938,13 +820,9 @@ static inline void net_service(void) {
 }
 
 // ===================== lwIP recv callback =====================
-
 static err_t tcp_recv_cb(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err) {
-    (void)arg;
-    (void)err;
-
+    (void)arg; (void)err;
     if (!p) {
-        // remote closed
         g_connected = false;
         g_pcb = NULL;
         return ERR_OK;
@@ -958,58 +836,40 @@ static err_t tcp_recv_cb(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t 
         rxbuf[rxlen] = 0;
         rx_dirty = true;
     }
-
     pbuf_free(p);
     return ERR_OK;
 }
 
 static void tcp_err_cb(void *arg, err_t err) {
-    (void)arg;
-    (void)err;
-    // lwIP already freed pcb; mark disconnected
+    (void)arg; (void)err;
     g_connected = false;
     g_pcb = NULL;
 }
 
-static uint32_t fw_len_bytes(void) {
-    const uint8_t *start = &__flash_binary_start;
-    const uint8_t *end   = &__flash_binary_end;
-    return (uint32_t)(end - start);
-}
-
 static err_t tcp_connected_cb(void *arg, struct tcp_pcb *tpcb, err_t err) {
     (void)arg;
-
     if (err != ERR_OK) return err;
 
     g_connected = true;
     g_pcb = tpcb;
 
-    char hello[256];
-    snprintf(
-        hello, sizeof(hello),
-        "{\"type\":\"HELLO\",\"device_id\":\"pico2w_%u\","
-        "\"fw_blocks_n\":%u,"
-        "\"max_req_blocks\":%u,"
-        "\"inject_bytes\":%u,"
-        "\"inject_off\":%u,"
-        "\"inject_max\":%u,"
-        "\"fw_len\":%u}\n",
-        DEVICE_ID,
-        (unsigned)FW_BLOCKS_N,
-        (unsigned)MAX_REQ_BLOCKS,
-        (unsigned)INJECT_BYTES,
-        (unsigned)inject_offset_from_fw_start(),
-        (unsigned)MAX_INJECT,
-        (unsigned)fw_len_bytes()
-    );
+    char hello[128];
+    snprintf(hello, sizeof(hello),
+         "{\"type\":\"HELLO\",\"device_id\":\"pico2w_%u\","
+         "\"fw_blocks_n\":%u,"
+         "\"max_req_blocks\":%u}\n",
+         DEVICE_ID,
+         (unsigned)FW_BLOCKS_N,
+         (unsigned)MAX_REQ_BLOCKS);
 
+    measurement_pause_for_net();
     comm_send_str(hello);
+    measurement_pause_for_net();
+
     return ERR_OK;
 }
 
 // ===================== WiFi init ONCE =====================
-
 static bool comm_wifi_init_once(void) {
     if (wifi_ready) return true;
 
@@ -1017,7 +877,6 @@ static bool comm_wifi_init_once(void) {
         printf("cyw43_arch_init failed\n");
         return false;
     }
-
     cyw43_arch_enable_sta_mode();
 
     const char *ssid = "Get your own";
@@ -1028,7 +887,6 @@ static bool comm_wifi_init_once(void) {
         printf("WiFi connect FAILED\n");
         return false;
     }
-
     printf("WiFi OK\n");
     wifi_ready = true;
 
@@ -1041,7 +899,6 @@ static bool comm_wifi_init_once(void) {
 }
 
 // ===================== TCP close helper =====================
-
 static void comm_tcp_close(void) {
     if (!g_pcb) return;
 
@@ -1049,7 +906,7 @@ static void comm_tcp_close(void) {
     tcp_arg(g_pcb, NULL);
     tcp_recv(g_pcb, NULL);
     tcp_err(g_pcb, NULL);
-    tcp_abort(g_pcb); // frees pcb immediately
+    tcp_abort(g_pcb);
     cyw43_arch_lwip_end();
 
     g_pcb = NULL;
@@ -1057,7 +914,6 @@ static void comm_tcp_close(void) {
 }
 
 // ===================== TCP connect only =====================
-
 static bool comm_tcp_connect(void) {
     if (!wifi_ready) return false;
 
@@ -1066,11 +922,9 @@ static bool comm_tcp_connect(void) {
     printf("ip4addr_aton ok=%d\n", ok);
     if (!ok) return false;
 
-    // nuke any old pcb
     comm_tcp_close();
 
     cyw43_arch_lwip_begin();
-
     g_pcb = tcp_new();
     if (!g_pcb) {
         cyw43_arch_lwip_end();
@@ -1090,38 +944,61 @@ static bool comm_tcp_connect(void) {
         comm_tcp_close();
         return false;
     }
-
     return true;
 }
 
 // ===================== reconnect with backoff =====================
-
 static void comm_ensure_connected(void) {
     if (g_connected && g_pcb) return;
+
     if (!time_reached(next_reconnect_at)) return;
-
     next_reconnect_at = make_timeout_time_ms(2000);
-
-    printf("reconnecting...\n");
 
     // IMPORTANT: do NOT re-init wifi on reconnect
     if (!comm_wifi_init_once()) return;
 
+    measurement_pause_for_net();
     (void)comm_tcp_connect();
+    measurement_pause_for_net();
+}
+
+// ===================== Workload step (network serviced OUTSIDE + gated) =====================
+static inline void run_workload_step(int label) {
+    const double fs = 250.0;
+
+    if (label == 0) generate_light_signal(fs);
+    else if (label == 1) generate_medium_signal(fs);
+    else generate_heavy_signal(fs);
+
+    low_pass_fir(sig_in, sig_filt, LEN, lp_coefficients, LPF_ORDER);
+
+    if (label == 1) {
+        low_pass_fir(sig_filt, sig_filt, LEN, lp_coefficients, LPF_ORDER);
+    } else if (label == 2) {
+        for (int k = 0; k < 3; ++k) {
+            low_pass_fir(sig_filt, sig_filt, LEN, lp_coefficients, LPF_ORDER);
+        }
+    }
+
+    hr_sink += compute_hr(sig_filt, LEN, fs, 0.2);
+
+    if (label == 0) sleep_ms(2);
 }
 
 // ===================== main =====================
-
 int main(void) {
     stdio_init_all();
     dwt_enable_all();
 
     next_reconnect_at = make_timeout_time_ms(0);
+    next_net_at = make_timeout_time_ms(0);
 
     (void)comm_wifi_init_once();
-    (void)comm_tcp_connect();
 
-    schedule_compromise();
+    // Gate connect so it doesn't pollute initial counters either
+    measurement_pause_for_net();
+    (void)comm_tcp_connect();
+    measurement_pause_for_net();
 
     // init prevs
     prev_t_us = time_us_64();
@@ -1138,11 +1015,30 @@ int main(void) {
     add_repeating_timer_ms(-2,   timer_2ms_cb,   NULL, &t2ms);
     add_repeating_timer_ms(-100, timer_100ms_cb, NULL, &t100ms);
 
-    // Force ONLY LIGHT workload forever
-    current_label = 0;
+    const uint32_t windows_per_class = 900;
+
+    for (int phase = 0; phase < 3; phase++) {
+        current_label = (uint32_t)phase;
+        uint32_t end_window = window_id + windows_per_class;
+
+        while (1) {
+            // service network in a gated, rate-limited way (invisible to counters)
+            net_service_gated_rl();
+
+            // do compute-only work (this is what counters should reflect)
+            run_workload_step((int)current_label);
+
+            uint32_t wid_now;
+            uint32_t flags = save_and_disable_interrupts();
+            wid_now = window_id;
+            restore_interrupts(flags);
+
+            if (wid_now >= end_window) break;
+        }
+    }
 
     while (1) {
-        net_service();         // keep stack alive (poll+parse+reconnect)
-        run_workload_step(0);  // light only
+        net_service_gated_rl();
+        sleep_ms(10);
     }
 }

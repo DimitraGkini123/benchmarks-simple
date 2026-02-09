@@ -1,3 +1,5 @@
+//old experiment with code injection that prints 
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -35,6 +37,7 @@
 #endif
 
 #define DEVICE_ID 1
+static volatile uint32_t do_payload_once = 0;
 
 static inline void dwt_enable_all(void) {
     DEMCR |= DEMCR_TRCENA;
@@ -205,7 +208,7 @@ static inline void payload_memscan(uint32_t size_bytes, uint32_t intensity) {
     uint32_t x = (uint32_t)time_us_64() ^ (uint32_t)DWT_CYCCNT;
 
     for (uint32_t pass = 0; pass < intensity; pass++) {
-        uint32_t stride = 1u + ((x >> 5) & 0x3Fu); // 1..64
+        uint32_t stride = 1u + ((x >> 5) & 0x7Fu); // 1..64
         for (uint32_t i = 0; i < size_bytes; i += stride) {
             x = xs32(x + i + pass);
             sandbox[i] ^= (uint8_t)x;
@@ -474,6 +477,8 @@ bool timer_100ms_cb(struct repeating_timer *t) {
     s.exc_per_cyc  = ((float)a.sum_exc)  / fdC;
     s.fold_per_cyc = ((float)a.sum_fold) / fdC;
 
+
+    do_payload_once = 1;
     (void)ring_push(&s);
     return true;
 }
@@ -495,6 +500,14 @@ static void stop_timers(void) {
     cancel_repeating_timer(&t2ms);
     cancel_repeating_timer(&t100ms);
     timers_running = false;
+}
+
+static inline bool take_do_payload_once(void) {
+    uint32_t irq = save_and_disable_interrupts();
+    bool ok = (do_payload_once != 0);
+    if (ok) do_payload_once = 0;
+    restore_interrupts(irq);
+    return ok;
 }
 
 static void reset_sampling_state(void) {
@@ -549,16 +562,18 @@ static inline void run_one_step(void) {
 
     // ---- "pseudo-injection": governed by FLASH config bytes (attested) ----
     volatile const inj_cfg_t *c = inj_cfg();
-    if ((c->magic == 0xC0FFEE00u) && (c->enabled != 0u)) {
+    if ((c->magic == 0xC0FFEE00u) && (c->enabled != 0u) && take_do_payload_once()) {
+        do_payload_once = 0;
 
-    uint32_t pat = c->pattern_id;
-    if (pat > PAY_ALU) pat = PAY_NONE;          // guard
+        uint32_t pat = c->pattern_id;
+        if (pat > PAY_ALU) pat = PAY_NONE;
 
-    uint32_t intensity = clamp_u32(c->intensity, 1u, 16u); // <- ξεκίνα με MAX 16, όχι 64
-    uint32_t size_bytes = clamp_u32(c->size_bytes, 64u, 4096u); // <- ξεκίνα με MAX 4096
+        uint32_t intensity = clamp_u32(c->intensity, 1u, 64u);     // τώρα μπορείς να σηκώσεις clamp
+        uint32_t size_bytes = clamp_u32(c->size_bytes, 64u, SANDBOX_BYTES);
 
-    injected_payload_step((pattern_t)pat, size_bytes, intensity);
-}
+        injected_payload_step((pattern_t)pat, size_bytes, intensity);
+    }
+
 
 
     if (current_workload == 0) sleep_ms(2);
